@@ -1,0 +1,114 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage[margin=1in]{geometry}
+
+\title{Two-Axis Difference Reward Scenarios}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+Let the observed team utility at step $t$ be
+\[
+\Gamma_t = \sum_j (P_t^j - C_t^j).
+\]
+
+Define two scenario axes:
+\[
+a \in \{\text{conflict-solver},\ \text{neutral},\ \text{conflict-causer}\},
+\]
+\[
+b \in \{\text{others-C},\ \text{others-P},\ \text{others-mean}\}.
+\]
+
+The two axes are separable:
+\begin{itemize}
+  \item The \textbf{others axis} $b$ governs $U_{\text{with}}$: it encodes the \emph{known} current state (what others are doing with agent $i$ present). Since the others observe the team outcome but cannot isolate $i$'s individual role, $U_{\text{with}}$ is indeterminate with respect to~$a$ and depends only on~$b$.
+  \item The \textbf{my-role axis} $a$ governs $U_{\text{without}}$: it encodes the \emph{counterfactual} baseline of what the team would achieve if agent $i$ were removed. This depends only on $i$'s role, not on which others scenario is active.
+\end{itemize}
+
+Define code-level scalars used by the forced scenario table:
+\[
+\text{full\_duration} = T \quad (\text{implementation: } T=\texttt{max\_steps\_per\_episode}),
+\]
+\[
+\text{my\_mean}_t^i = \frac{1}{N_t^i}\sum_{\tau \le t} P_\tau^i
+\quad
+(\text{running mean of observed } P^i \text{ samples; used in logging only}),
+\]
+\[
+\text{my\_P}_t^i = P_t^i,\qquad \text{my\_C}_t^i = C_t^i,\qquad
+\text{observed\_util}_t = \Gamma_t.
+\]
+
+For each $(a,b)$, define two forced components:
+\[
+U_{\text{without}}^{(a,b)}(t,i),\qquad U_{\text{with}}^{(a,b)}(t,i).
+\]
+
+Using row order
+\[
+a \in (\text{solver},\text{neutral},\text{causer}),
+\]
+and column order
+\[
+b \in (\text{AllC},\text{AllP},\text{AllSame}),
+\]
+the forced tables are:
+\[
+U_{\text{without}}=
+\begin{bmatrix}
+0 & 0 & 0 \\
+\text{my\_P}_t^i & \text{my\_P}_t^i & \text{my\_P}_t^i \\
+\text{full\_duration} & \text{full\_duration} & \text{full\_duration}
+\end{bmatrix},
+\]
+\[
+U_{\text{with}}=
+\begin{bmatrix}
+0 & \text{full\_duration} & \text{observed\_util}_t \\
+0 & \text{full\_duration} & \text{observed\_util}_t \\
+0 & \text{full\_duration} & \text{observed\_util}_t
+\end{bmatrix}.
+\]
+
+Per-scenario difference reward is
+\[
+D_t^{(a,b)} = U_{\text{with}}^{(a,b)}(t,i)-U_{\text{without}}^{(a,b)}(t,i),
+\]
+which, due to separability, simplifies to
+\[
+D_t^{(a,b)} =
+\begin{bmatrix}
+0 & \text{full\_duration} & \text{observed\_util}_t \\
+-\text{my\_P}_t^i & \text{full\_duration}-\text{my\_P}_t^i & \text{observed\_util}_t - \text{my\_P}_t^i \\
+-\text{full\_duration} & 0 & \text{observed\_util}_t - \text{full\_duration}
+\end{bmatrix}.
+\]
+
+Use factorized state-dependent gates:
+\[
+u(a \mid z_t^i) = \mathrm{softmax}(g_A(z_t^i))_a,\quad
+v(b \mid z_t^i) = \mathrm{softmax}(g_B(z_t^i))_b,
+\]
+\[
+w_{a,b}(z_t^i) = u(a \mid z_t^i)\,v(b \mid z_t^i), \qquad \sum_{a,b} w_{a,b}(z_t^i) = 1.
+\]
+
+The final reward used for learning is
+\[
+R_t^i = \sum_{a,b} w_{a,b}(z_t^i)\,D_t^{(a,b)}.
+\]
+
+\paragraph{Math-to-code mapping.}
+\[
+\Gamma_t \leftrightarrow \texttt{team\_utility},\quad
+\text{my\_P}_t^i \leftrightarrow \texttt{own\_p},\quad
+\text{my\_C}_t^i \leftrightarrow \texttt{own\_c}.
+\]
+The tensors \texttt{without\_me}, \texttt{with\_me}, and
+\texttt{scenario\_delta = with\_me - without\_me} are constructed directly from these terms.
+
+\end{document}
+

@@ -1,0 +1,26 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# IDE/project internals
+.cursor/
+
+# Training artifacts
+artifacts/
+dqn_weights_*.pt
+pc_critic_*.pt
+training_metrics*.csv
+training_convergence*.png
+out.txt
+test_out.txt
+*.csv
+*.png
+paper.txt
+*.pdf
+*.xlsx
+paper_text.txt

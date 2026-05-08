@@ -1,0 +1,11 @@
+numpy
+pygame
+pettingzoo
+gymnasium
+# PyPI installs CPU-only wheels (version shows +cpu). torchvision does not add CUDA.
+# For an NVIDIA GPU, reinstall torch from PyTorch's index after this file, e.g.:
+#   pip uninstall -y torch torchvision
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Pick cu124 / cu121 / etc. from https://pytorch.org/get-started/locally/
+torch>=1.13.0
+matplotlib
