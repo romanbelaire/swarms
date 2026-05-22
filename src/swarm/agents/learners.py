@@ -104,7 +104,7 @@ class DRScenarioMixtureLearner:
         lr: float = 5e-4,
         hidden_dim: int = 64,
         entropy_coef: float = 0.0,
-        full_duration: float = 50.0,
+        full_duration: float = 1.0,
         my_mean_mode: str = "running_own_p_mean",
     ):
         self.net, self.device = _safe_module_to_device(

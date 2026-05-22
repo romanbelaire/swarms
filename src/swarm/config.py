@@ -5,10 +5,13 @@ MAX_STEPS_PER_EPISODE = 50
 # Solo expert needs time to reach food and base; main DR train keeps short horizons by default.
 EXPERT_DEFAULT_MAX_STEPS_PER_EPISODE = 400
 EXPERT_EVAL_EVERY_EPISODES = 100
-GRID_SIZE = 7
-NUM_FOOD = 5
+# Match common ablation CLI defaults (`run_ablations.py`); override per run as needed.
+GRID_SIZE = 10
+NUM_FOOD = 10
 LOCAL_GRID_SIZE = 5
-# Last three entries: planar position in [0, 2] (see normalized_planar_position_xy) + carry {0, 1}; full vec float32.
+# Tiles, then planar position in [0, 2], carry {0, 1}.
+# Freeze / immune durations live in infos. Immune agents see peers masked out in tile channels
+# (empty ground) while keeping this shape so legacy experts still load.
 OBS_DIM = LOCAL_GRID_SIZE * LOCAL_GRID_SIZE + 2 + 1
 
 N_ACTIONS_FULL = 5
@@ -22,6 +25,11 @@ MOVE_CLEAR_ACTION = 5
 HANDSHAKE_ACTION = 6
 RESERVE_PARITY_ACTION = 7
 RESERVE_PARITY_ESCAPE_ACTION = 8
+
+N_CONFLICT_ARMS = 11  # len(swarm.training.train.CONFLICT_ACTION_NAMES)
+CONFLICT_ARM_PRIORITY_SWAP_N3 = 8
+CONFLICT_ARM_PASS_FOOD_N3 = 9
+CONFLICT_ARM_FREEZE_TAG = 10
 
 TASK_AVOID_ENABLED_ACTION_IDS = [
     action_id
@@ -40,3 +48,9 @@ TASK_AVOID_ENABLED_ACTION_IDS = [
 ]
 N_ACTIONS_TASK_AVOID = len(TASK_AVOID_ENABLED_ACTION_IDS)
 
+# Conflict-instance window cap for P/C normalization (0 = no cap).
+MAX_CONFLICT_STEPS = 0
+MAX_CONFLICT_STEPS_TYPE = "time"
+
+# Max normalized conflict-window utility (p+c length-normalized P/C => full window = 1).
+FULL_DURATION_NORM = 1.0

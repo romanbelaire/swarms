@@ -28,7 +28,8 @@ class RationalSwarmForagingVecEnv:
       - ``step(actions)`` -> observations, rewards, terminations, truncations, infos
     Each ``actions[agent_id]`` is ``(num_envs,)`` int32 in ``[0, 4]``.
     Observations are ``(num_envs, obs_dim)`` float32 per agent (tile channels in ``[0, 5]``, then
-    normalized planar position in ``[0, 2]``, then carrying in ``{0, 1}``).
+    normalized planar position in ``[0, 2]``, then carrying in ``{0, 1}``). Matches
+    ``RationalSwarmForagingEnv`` observation layout (freeze/immune are not in vec obs).
     """
 
     def __init__(

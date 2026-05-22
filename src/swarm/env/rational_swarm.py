@@ -22,6 +22,9 @@ def normalized_planar_position_xy(ax: np.ndarray, ay: np.ndarray, grid_size: int
     return nx.astype(np.float32), ny.astype(np.float32)
 
 
+FREEZE_TAG_TURNS = 3
+
+
 class RationalSwarmForagingEnv(ParallelEnv):
     """
     A 2D Grid Foraging Environment using the Rational Swarms Difference Reward Model (Kaminka et al. 2025).
@@ -36,25 +39,24 @@ class RationalSwarmForagingEnv(ParallelEnv):
     into the same cell, both are forced into avoidance with a short lockout (see step).
 
     **Observation space** (per agent): Box with ``dtype=float32``, shape ``(obs_dim,)`` where
-    ``obs_dim = local_grid_size ** 2 + 3``.
+    ``obs_dim = local_grid_size ** 2 + 3`` (tiles + planar position + carry).
 
-    Layout (concatenated in order):
+    immunity / freeze durations are exposed in ``infos``, not appended to observations, so frozen
+    task experts trained at the legacy ``OBS_DIM`` still load without shape mismatch.
 
-    1. Local egocentric tile map — local_grid_size * local_grid_size values in ``[0, 5]`` (row-major
-       order; outer loop over i, inner over j in _get_obs). The agent sits at the center cell. Types:
+    **Freeze / immunity:** ``agent_freeze_remaining`` freezes movement. ``agent_immune_priority`` is
+    ``0`` normally; when immunity is granted it becomes a positive ticket (tie-break elsewhere).
+    Immune agents run **as a perceptual ghost for one food haul**: observations mask all other
+    agents as empty tiles (base/food/obstacle framing unchanged); they skip avoidance lockout,
+    positional ``position_claims`` mediation, and apply their move intent unconditionally (overlap
+    allowed). Training conflict flags keyed off ``n_local`` thus stay off while immune (no partners in
+    the local grid). Immunity clears on successful deposit at the base.
 
-       - 0: empty floor
-       - 1: base (where food is delivered for reward)
-       - 2: food pellet
-       - 3: another agent currently in program (task) mode
-       - 4: another agent currently in avoidance mode
-       - 5: out-of-world padding (window crosses the grid border)
+    Non-immune agents resolve shared cells as usual; immune agents never appear in ``position_claims``.
 
-    2. Self position — two floats in ``[0, 2]``: agent cell index minus grid midpoint, divided by the
-       coordinate half-span, mapped linearly so the grid center is ``1.0`` and the two extremes along
-       each axis are ``0.0`` and ``2.0`` (same encoding for any ``grid_size >= 2``).
-
-    3. Carrying flag — ``1.0`` if holding food, else ``0.0``.
+    **``suppress_agent_collision``:** when true, positional conflict resolution between non-immune
+    agents is skipped: every agent occupies its ``next_positions`` intent, overlaps allowed (except
+    food/base logic unchanged).
 
     **Rewards:** rewards[agent] += 1 when that agent deposits food at the base. Training code uses infos[agent] ("env_reward", "p_t", "c_t", "n_local") for shaping and logging.
     """
@@ -64,7 +66,17 @@ class RationalSwarmForagingEnv(ParallelEnv):
         "name": "rational_swarms_foraging_v0",
     }
 
-    def __init__(self, n_agents=3, grid_size=10, num_food=5, alpha=1.0, beta=1.0, local_grid_size=5, render_mode=None):
+    def __init__(
+        self,
+        n_agents=3,
+        grid_size=10,
+        num_food=5,
+        alpha=1.0,
+        beta=1.0,
+        local_grid_size=5,
+        render_mode=None,
+        suppress_agent_collision: bool = False,
+    ):
         self.n_agents = n_agents
         self.grid_size = grid_size
         self.num_food = num_food
@@ -72,6 +84,7 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.beta = beta
         self.local_grid_size = local_grid_size
         self.render_mode = render_mode
+        self.suppress_agent_collision = suppress_agent_collision
         if self.grid_size <= 0:
             raise ValueError("grid_size must be positive")
         if self.local_grid_size <= 0:
@@ -112,6 +125,9 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.agent_avoidance_remaining = {}
         self.P_time = {}
         self.C_time = {}
+        self.agent_freeze_remaining = {}
+        self.agent_immune_priority = {}
+        self._immune_ticket_seq = 0
 
         self.window = None
         self.clock = None
@@ -150,6 +166,9 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.P_time = {agent: 0 for agent in self.agents}
         self.C_time = {agent: 0 for agent in self.agents}
         self.agent_holding_food = {agent: False for agent in self.agents}
+        self.agent_freeze_remaining = {agent: 0 for agent in self.agents}
+        self.agent_immune_priority = {agent: 0 for agent in self.agents}
+        self._immune_ticket_seq = 0
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: {} for agent in self.agents}
@@ -161,12 +180,16 @@ class RationalSwarmForagingEnv(ParallelEnv):
         food_set = {tuple(f) for f in self.food_positions}
         base_tuple = tuple(self.base_position)
         other_agent_at = {}
-        for a in self.agents:
-            if a == agent:
-                continue
-            pos = tuple(self.agent_positions[a])
-            if pos not in other_agent_at or self.agent_modes[a] == "program":
-                other_agent_at[pos] = 3 if self.agent_modes[a] == "program" else 4
+        if self.agent_immune_priority[agent] <= 0:
+            for a in self.agents:
+                if a == agent:
+                    continue
+                pos = tuple(self.agent_positions[a])
+                val = 3 if self.agent_modes[a] == "program" else 4
+                if pos not in other_agent_at:
+                    other_agent_at[pos] = val
+                elif val == 3:
+                    other_agent_at[pos] = 3
 
         grid_flat = []
         for i in range(self.local_grid_size):
@@ -189,6 +212,46 @@ class RationalSwarmForagingEnv(ParallelEnv):
         obs = np.concatenate([tiles, nx, ny, np.array([holding], dtype=np.float32)])
         return obs
 
+    def _orthogonal_neighbor_agent_ids(self, agent: str) -> list[str]:
+        ax, ay = self.agent_positions[agent]
+        out = []
+        for other_id in self.agents:
+            if other_id == agent:
+                continue
+            ox, oy = self.agent_positions[other_id]
+            if ox == ax - 1 and oy == ay:
+                out.append(other_id)
+            elif ox == ax + 1 and oy == ay:
+                out.append(other_id)
+            elif ox == ax and oy == ay - 1:
+                out.append(other_id)
+            elif ox == ax and oy == ay + 1:
+                out.append(other_id)
+        return out
+
+    def apply_freeze_tag_pair(self, agent_a: str, agent_b: str):
+        self.agent_freeze_remaining[agent_a] = FREEZE_TAG_TURNS
+        self.agent_freeze_remaining[agent_b] = FREEZE_TAG_TURNS
+
+    def grant_immunity_unlock_bulk(self, agent_ids: tuple[str, ...]):
+        for agent in agent_ids:
+            self.agent_freeze_remaining[agent] = 0
+            self.agent_avoidance_remaining[agent] = 0
+            self._immune_ticket_seq += 1
+            self.agent_immune_priority[agent] = self._immune_ticket_seq
+
+    def _frozen_nonimmune_blocks_cell(self, pos_tuple: tuple[int, int], mover_id: str) -> bool:
+        for a in self.agents:
+            if a == mover_id:
+                continue
+            if self.agent_freeze_remaining[a] <= 0:
+                continue
+            if self.agent_immune_priority[a] > 0:
+                continue
+            if tuple(self.agent_positions[a]) == pos_tuple:
+                return True
+        return False
+
     def _n_local_neighborhood(self, obs: np.ndarray) -> int:
         # Conflict semantics: only orthogonally adjacent agents count as local neighbors.
         n_tiles = self.local_grid_size ** 2
@@ -205,10 +268,49 @@ class RationalSwarmForagingEnv(ParallelEnv):
             self.agents = []
             return {}, {}, {}, {}, {}
 
+        prev_positions = {agent: list(self.agent_positions[agent]) for agent in self.agents}
+
+        for agent in self.agents:
+            if self.agent_freeze_remaining[agent] <= 0:
+                continue
+            frozen_neighbors = 0
+            for nid in self._orthogonal_neighbor_agent_ids(agent):
+                if self.agent_freeze_remaining[nid] > 0:
+                    frozen_neighbors += 1
+            if frozen_neighbors >= 2:
+                self.agent_freeze_remaining[agent] = 0
+                self.agent_avoidance_remaining[agent] = 0
+                self._immune_ticket_seq += 1
+                self.agent_immune_priority[agent] = self._immune_ticket_seq
+
         next_positions = {}
         for agent in self.agents:
             action = actions.get(agent, 4)
             current_pos = self.agent_positions[agent]
+
+            if self.agent_freeze_remaining[agent] > 0:
+                self.agent_modes[agent] = "program"
+                self.P_time[agent] += 1
+                next_positions[agent] = list(current_pos)
+                continue
+
+            if self.agent_immune_priority[agent] > 0:
+                self.agent_modes[agent] = "program"
+                self.P_time[agent] += 1
+                if action == 4:
+                    next_positions[agent] = list(current_pos)
+                else:
+                    new_pos = list(current_pos)
+                    if action == 0 and new_pos[0] > 0:
+                        new_pos[0] -= 1
+                    elif action == 1 and new_pos[0] < self.grid_size - 1:
+                        new_pos[0] += 1
+                    elif action == 2 and new_pos[1] > 0:
+                        new_pos[1] -= 1
+                    elif action == 3 and new_pos[1] < self.grid_size - 1:
+                        new_pos[1] += 1
+                    next_positions[agent] = new_pos
+                continue
 
             if self.agent_avoidance_remaining[agent] > 0:
                 self.agent_avoidance_remaining[agent] -= 1
@@ -234,37 +336,78 @@ class RationalSwarmForagingEnv(ParallelEnv):
                     new_pos[1] += 1
                 next_positions[agent] = new_pos
 
-        position_claims = {}
-        for agent, pos in next_positions.items():
-            pos_tuple = tuple(pos)
-            if pos_tuple not in position_claims:
-                position_claims[pos_tuple] = []
-            position_claims[pos_tuple].append(agent)
+        self._collision_conflict_event = {agent: False for agent in self.agents}
 
-        for claiming_agents in position_claims.values():
-            if len(claiming_agents) > 1:
-                for agent in claiming_agents:
-                    if self.agent_modes[agent] == "program":
-                        self.P_time[agent] -= 1
-                        self.C_time[agent] += 1
-                        self.agent_modes[agent] = "avoidance"
-                        self.agent_avoidance_remaining[agent] = 2
-            else:
-                self.agent_positions[claiming_agents[0]] = next_positions[claiming_agents[0]]
+        if self.suppress_agent_collision:
+            for agent in self.agents:
+                self.agent_positions[agent] = list(next_positions[agent])
+        else:
+            for agent in self.agents:
+                if self.agent_immune_priority[agent] > 0:
+                    self.agent_positions[agent] = list(next_positions[agent])
 
-        for agent in self.agents:
+            for agent in self.agents:
+                if self.agent_freeze_remaining[agent] > 0:
+                    self.agent_positions[agent] = list(next_positions[agent])
+
+            position_claims: dict[tuple[int, int], list[str]] = {}
+            for agent in self.agents:
+                if self.agent_immune_priority[agent] > 0:
+                    continue
+                if self.agent_freeze_remaining[agent] > 0:
+                    continue
+                pos_tuple = tuple(next_positions[agent])
+                if pos_tuple not in position_claims:
+                    position_claims[pos_tuple] = []
+                position_claims[pos_tuple].append(agent)
+
+            for pos_tuple, claiming_agents in position_claims.items():
+                if len(claiming_agents) > 1:
+                    for agent in claiming_agents:
+                        if self.agent_modes[agent] == "program":
+                            self.P_time[agent] -= 1
+                            self.C_time[agent] += 1
+                            self.agent_modes[agent] = "avoidance"
+                            self.agent_avoidance_remaining[agent] = 2
+                        self._collision_conflict_event[agent] = True
+                        self.agent_positions[agent] = prev_positions[agent]
+                    continue
+
+                lone = claiming_agents[0]
+                target = tuple(next_positions[lone])
+                prev_tuple = tuple(prev_positions[lone])
+                if (
+                    target != prev_tuple
+                    and self._frozen_nonimmune_blocks_cell(target, lone)
+                ):
+                    if self.agent_modes[lone] == "program":
+                        self.P_time[lone] -= 1
+                        self.C_time[lone] += 1
+                        self.agent_modes[lone] = "avoidance"
+                        self.agent_avoidance_remaining[lone] = 2
+                    self._collision_conflict_event[lone] = True
+                    self.agent_positions[lone] = prev_positions[lone]
+                else:
+                    self.agent_positions[lone] = next_positions[lone]
+
+        for agent in sorted(self.agents):
             if self.agent_holding_food[agent] and tuple(self.agent_positions[agent]) == self.base_position:
                 self.agent_holding_food[agent] = False
+                self.agent_immune_priority[agent] = 0
                 rewards[agent] += 1.0
                 while len(self.food_positions) < self.num_food:
                     new_f = [np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size)]
                     if new_f != list(self.base_position) and new_f not in self.food_positions:
                         self.food_positions.append(new_f)
 
-        for agent in self.agents:
+        for agent in sorted(self.agents):
             if not self.agent_holding_food[agent] and tuple(self.agent_positions[agent]) in [tuple(f) for f in self.food_positions]:
                 self.food_positions = [f for f in self.food_positions if tuple(f) != tuple(self.agent_positions[agent])]
                 self.agent_holding_food[agent] = True
+
+        for agent in self.agents:
+            if self.agent_freeze_remaining[agent] > 0:
+                self.agent_freeze_remaining[agent] -= 1
 
         env_reward = sum(rewards.values())
         observations = {agent: self._get_obs(agent) for agent in self.agents}
@@ -280,6 +423,10 @@ class RationalSwarmForagingEnv(ParallelEnv):
                 "p_t": p_t,
                 "c_t": c_t,
                 "n_local": self._n_local_neighborhood(o),
+                "new_conflict_event": float(self._collision_conflict_event[agent]),
+                "freeze_remaining": float(self.agent_freeze_remaining[agent]),
+                "immune_priority": float(self.agent_immune_priority[agent]),
+                "is_immune": float(int(self.agent_immune_priority[agent] > 0)),
             }
 
         return observations, rewards, terminations, truncations, infos
@@ -323,7 +470,14 @@ class RationalSwarmForagingEnv(ParallelEnv):
             pos = self.agent_positions[agent]
             mode = self.agent_modes[agent]
             holding = self.agent_holding_food[agent]
-            color = (255, 0, 0) if mode == "avoidance" else (0, 0, 0)
+            immune = self.agent_immune_priority[agent] > 0
+            frozen = self.agent_freeze_remaining[agent] > 0
+            if immune:
+                color = (0, 200, 255)
+            elif frozen:
+                color = (160, 160, 220)
+            else:
+                color = (255, 0, 0) if mode == "avoidance" else (0, 0, 0)
 
             offset_x = (idx % 3 - 1) * 5
             offset_y = (idx // 3) * 5

@@ -78,6 +78,7 @@ def _run_and_collect(
     baseline_mode: str,
     fixed_conflict_action: str,
     bandit_reward_model: str,
+    bandit_conflict_arms: str,
     resume: bool,
     grid_size: int,
     num_food: int,
@@ -101,6 +102,7 @@ def _run_and_collect(
         "arm_reserve_parity_escape_prob",
         "arm_priority_swap_n3_prob",
         "arm_pass_food_n3_prob",
+        "arm_freeze_tag_prob",
     ]
     if resume:
         resumed_last = _load_last_row_if_complete(
@@ -121,6 +123,7 @@ def _run_and_collect(
     run_args["baseline_mode"] = baseline_mode
     run_args["fixed_conflict_action"] = fixed_conflict_action
     run_args["bandit_reward_model"] = bandit_reward_model
+    run_args["bandit_conflict_arms"] = bandit_conflict_arms
     run_args["expert_checkpoint"] = expert_checkpoint
     run_args["metrics_csv"] = str(metrics_path)
     run_args["load_weights"] = None
@@ -151,6 +154,7 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         baseline_mode=task["baseline_mode"],
         fixed_conflict_action=task["fixed_conflict_action"],
         bandit_reward_model=task["bandit_reward_model"],
+        bandit_conflict_arms=task["bandit_conflict_arms"],
         resume=task["resume"],
         grid_size=task["grid_size"],
         num_food=task["num_food"],
@@ -187,6 +191,15 @@ def build_ablation_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid_size", type=int, default=10)
     parser.add_argument("--num_food", type=int, default=10)
     parser.add_argument("--local_grid_size", type=int, default=5)
+    parser.add_argument(
+        "--bandit_conflict_arms",
+        type=str,
+        default="randomwalk3,freeze_tag,wait3,move_clear,backward3",
+        help=(
+            "bandit_ucb1 sweep only: comma-separated arms (canonical names); empty string uses full CONFLICT_ACTION_NAMES. "
+            "Aliases understood via train.CONFLICT_ACTION_ALIASES (e.g. wait_3, backwards_2)."
+        ),
+    )
     return parser
 
 
@@ -224,6 +237,7 @@ def main():
         "reserve_parity_escape",
         "priority_swap_n3",
         "pass_food_n3",
+        "freeze_tag",
     ]
     fixed_tasks: list[dict[str, str | int]] = []
     fixed_once_rows: list[dict[str, float | str | int]] = []
@@ -250,17 +264,46 @@ def main():
                     "baseline_mode": "fixed_conflict",
                     "fixed_conflict_action": action_name,
                     "bandit_reward_model": "neutral_allsame",
+                    "bandit_conflict_arms": "",
                     "resume": args.resume,
                     "force_cpu": args.cpu,
                 }
             )
             fixed_task_idx += 1
+        run_name_cf = f"fixed_collision_free_agents{n_agents}_seed{fixed_once_seed}"
+        fixed_tasks.append(
+            {
+                "task_idx": fixed_task_idx,
+                "out_dir": str(out_dir),
+                "run_name": run_name_cf,
+                "n_agents": n_agents,
+                "seed": fixed_once_seed,
+                "episodes": args.episodes,
+                "max_steps_per_episode": args.max_steps_per_episode,
+                "num_envs": args.num_envs,
+                "reward_mode": args.reward_mode,
+                "grid_size": args.grid_size,
+                "num_food": args.num_food,
+                "local_grid_size": args.local_grid_size,
+                "expert_checkpoint": args.expert_checkpoint,
+                "baseline_mode": "collision_free",
+                "fixed_conflict_action": "backward3",
+                "bandit_reward_model": "neutral_allsame",
+                "bandit_conflict_arms": "",
+                "resume": args.resume,
+                "force_cpu": args.cpu,
+            }
+        )
+        fixed_task_idx += 1
     fixed_results = _execute_tasks(fixed_tasks, args.num_workers)
     for task, (_, last) in zip(fixed_tasks, fixed_results):
+        method_slug = (
+            "collision_free" if task["baseline_mode"] == "collision_free" else str(task["fixed_conflict_action"])
+        )
         fixed_once_rows.append(
             {
                 "run_name": str(task["run_name"]),
-                "method": f"fixed_once_{task['fixed_conflict_action']}",
+                "method": f"fixed_once_{method_slug}",
                 "n_agents": int(task["n_agents"]),
                 "seed": fixed_once_seed,
                 "episode_env_reward": float(last["episode_env_reward"]),
@@ -296,6 +339,7 @@ def main():
                         "baseline_mode": method["baseline_mode"],
                         "fixed_conflict_action": "backward3",
                         "bandit_reward_model": method["bandit_reward_model"],
+                        "bandit_conflict_arms": args.bandit_conflict_arms,
                         "method": method["name"],
                         "plot_order": method["plot_order"],
                         "resume": args.resume,
@@ -327,6 +371,7 @@ def main():
                 "arm_reserve_parity_escape_prob": float(last["arm_reserve_parity_escape_prob"]),
                 "arm_priority_swap_n3_prob": float(last["arm_priority_swap_n3_prob"]),
                 "arm_pass_food_n3_prob": float(last["arm_pass_food_n3_prob"]),
+                "arm_freeze_tag_prob": float(last["arm_freeze_tag_prob"]),
             }
         )
 

@@ -9,7 +9,9 @@ This document translates the requested 3x3 scenario definitions into exact equat
 - Let agent `i` utility be:
   - `my_util = my_P - my_C`
 - Let:
-  - `full_duration` be the maximum normalized utility level for a full episode window
+  - `full_duration = 1` be the maximum normalized utility for a full conflict window
+    (`p+c` over the instance; with length-normalized `my_P` / `my_C`, a full program or
+    avoidance window has share 1)
   - `my_mean` be a deterministic scalar (running mean of observed `P^i` samples)
 
 For each scenario `(role, others_model)`, define:
@@ -57,9 +59,15 @@ The two axes are separable:
 ## Math-to-Code Mapping Targets
 
 - `Gamma_obs` / `observed_util` -> current `team_utility` batch/scalar passed to DR learner
-- `my_P` -> current `own_p`
-- `my_C` -> current `own_c`
-- `full_duration` -> deterministic scalar constant in learner config or runtime input
+- `my_P` -> per closed conflict instance, `sum(p_t) / (sum(p_t) + sum(c_t))` over the
+  full episode of that conflict: avoidance steps while `n_local > 1`, then program
+  steps (including immune haul) until `n_local > 1` again; averaged over closed instances.
+  Still splits when `max_conflict_steps` is exceeded without leaving the neighborhood
+  (forced close + new avoidance instance; current step only in the new window).
+- `my_C` -> `1 - my_P` for the same instance (i.e. `sum(c_t) / (sum(p_t) + sum(c_t))`)
+- `full_duration` -> `FULL_DURATION_NORM` (1.0) in `config.py`
+- UCB bandit DR updates use `softplus(D)` so rewards are positive and stationary
+- Default bandit credit (`instance_credited`): one UCB update per **closed conflict instance** for the active macro arm, using that instance's normalized `p`, `c`, and team util (not episode-shared)
 - `my_mean` -> running mean of observed `P^i` samples (used in stats/logging only; no longer appears in scenario table)
 - `D(role, others)` -> per-scenario reward tensor `scenario_delta = with_me - without_me`
 

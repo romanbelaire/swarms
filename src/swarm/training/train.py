@@ -13,6 +13,15 @@ if __package__ is None:
         sys.path.insert(0, _src_s)
 
 from swarm.env import RationalSwarmForagingEnv
+from swarm.conflict_instances import (
+    ClosedConflictInstance,
+    ConflictInstanceTracker,
+    episode_mean_own_p_norm,
+    episode_mean_own_p_norm_all_envs,
+    episode_mean_team_util_norm,
+    episode_mean_team_util_norm_all_envs,
+    new_conflict_trackers,
+)
 from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit
 from swarm.config import (
     N_EPISODES,
@@ -33,6 +42,9 @@ from swarm.config import (
     RESERVE_PARITY_ACTION,
     RESERVE_PARITY_ESCAPE_ACTION,
     TASK_AVOID_ENABLED_ACTION_IDS,
+    MAX_CONFLICT_STEPS,
+    MAX_CONFLICT_STEPS_TYPE,
+    FULL_DURATION_NORM,
 )
 
 CONFLICT_ACTION_NAMES = [
@@ -46,11 +58,16 @@ CONFLICT_ACTION_NAMES = [
     "reserve_parity_escape",
     "priority_swap_n3",
     "pass_food_n3",
+    "freeze_tag",
 ]
 ACTION_DELTAS = {0: (-1, 0), 1: (1, 0), 2: (0, -1), 3: (0, 1)}
 PRIORITY_SWAP_TOKEN_STEPS = 3
 CONFLICT_ACTION_ALIASES = {
     "swap_food_n3": "pass_food_n3",
+    "wait_3": "wait3",
+    "backward_3": "backward3",
+    "backwards_2": "backward3",
+    "backwards_3": "backward3",
 }
 BANDIT_REWARD_MODEL_NAMES = [
     "solver_allc",
@@ -62,6 +79,13 @@ BANDIT_REWARD_MODEL_NAMES = [
     "causer_allc",
     "causer_allp",
     "causer_allsame",
+]
+BANDIT_CREDIT_MODE_NAMES = [
+    "instance_credited",
+    "episode_shared",
+    "per_arm_credited",
+    "arm_relative_my_role",
+    "step_level",
 ]
 
 
@@ -174,6 +198,74 @@ def resolve_handshake_step(
         if len(neighbors) > 0:
             neighbor_idx = int(np.random.randint(0, len(neighbors)))
             headings[agent_id] = neighbors[neighbor_idx][1]
+        low_actions[agent_id] = 4
+        macro_queues[agent_id] = [4, 4]
+
+
+def _freeze_tag_selected_components(freeze_selected: set[str], positions: dict[str, list[int]]) -> list[set[str]]:
+    adjacency: dict[str, list[str]] = {agent_id: [] for agent_id in freeze_selected}
+    for aid in freeze_selected:
+        for other_id, _ in adjacent_agents(aid, positions):
+            if other_id in freeze_selected:
+                adjacency[aid].append(other_id)
+    visited: set[str] = set()
+    components: list[set[str]] = []
+    for start in sorted(freeze_selected):
+        if start in visited:
+            continue
+        stack = [start]
+        comp: set[str] = set()
+        while len(stack) > 0:
+            u = stack.pop()
+            if u in visited:
+                continue
+            visited.add(u)
+            comp.add(u)
+            for v in adjacency[u]:
+                if v not in visited:
+                    stack.append(v)
+        components.append(comp)
+    return components
+
+
+def resolve_freeze_tag_step(
+    freeze_selected: set[str],
+    env: RationalSwarmForagingEnv,
+    expert_actions_subset: dict[str, int],
+    low_actions: dict[str, int],
+    macro_queues: dict[str, list[int]],
+    positions: dict[str, list[int]],
+):
+    succeeded = set()
+    for comp in _freeze_tag_selected_components(freeze_selected, positions):
+        if len(comp) < 3:
+            continue
+        env.grant_immunity_unlock_bulk(tuple(sorted(comp)))
+        for aid in comp:
+            low_actions[aid] = int(expert_actions_subset[aid])
+            macro_queues[aid] = []
+        succeeded.update(comp)
+
+    sorted_sel = sorted(freeze_selected)
+    for aid in sorted_sel:
+        if aid in succeeded:
+            continue
+        partner_candidates = sorted(
+            [nid for nid, _ in adjacent_agents(aid, positions) if nid in freeze_selected and nid not in succeeded]
+        )
+        if len(partner_candidates) == 0:
+            continue
+        partner = partner_candidates[0]
+        env.apply_freeze_tag_pair(aid, partner)
+        low_actions[aid] = int(expert_actions_subset[aid])
+        low_actions[partner] = int(expert_actions_subset[partner])
+        macro_queues[aid] = []
+        macro_queues[partner] = []
+        succeeded.add(aid)
+        succeeded.add(partner)
+    for agent_id in freeze_selected:
+        if agent_id in succeeded:
+            continue
         low_actions[agent_id] = 4
         macro_queues[agent_id] = [4, 4]
 
@@ -349,8 +441,13 @@ def resolve_pass_food_n3_step(
         agent_holding_food[receiver_id] = True
 
     for agent_id in pass_selected:
+        n_adjacent_agents = len(adjacent_agents(agent_id, positions))
+        mc = move_clear_action(obs_by_agent[agent_id])
         low_actions[agent_id] = 4
-        macro_queues[agent_id] = [4, 4, move_clear_action(obs_by_agent[agent_id])]
+        if n_adjacent_agents >= 2:
+            macro_queues[agent_id] = [mc]
+        else:
+            macro_queues[agent_id] = [4, 4, mc]
 
 
 def resolve_priority_swap_selection_step(
@@ -484,8 +581,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--baseline_mode",
         type=str,
         default="none",
-        choices=["none", "bandit_ucb1", "random_conflict", "fixed_conflict"],
-        help="Ablation baseline mode. 'none' runs learned DQN pipeline.",
+        choices=["none", "bandit_ucb1", "random_conflict", "fixed_conflict", "collision_free"],
+        help="Ablation baseline mode. 'none' runs learned DQN pipeline. "
+        "'collision_free' runs expert-task actions only with inter-agent positional collisions disabled.",
     )
     parser.add_argument(
         "--fixed_conflict_action",
@@ -501,7 +599,41 @@ def build_parser() -> argparse.ArgumentParser:
         choices=BANDIT_REWARD_MODEL_NAMES,
         help="DR reward model used for UCB1 bandit updates in baseline mode.",
     )
+    parser.add_argument(
+        "--bandit_conflict_arms",
+        type=str,
+        default="",
+        help=(
+            "bandit_ucb1 only: comma-separated subset of conflict macros "
+            "(default empty = full list CONFLICT_ACTION_NAMES). "
+            'Example: "randomwalk3,freeze_tag,wait3,move_clear,backward3". Aliases: wait_3, backwards_2.'
+        ),
+    )
+    parser.add_argument(
+        "--bandit_credit_mode",
+        type=str,
+        default="instance_credited",
+        choices=BANDIT_CREDIT_MODE_NAMES,
+        help="How bandit_ucb1 assigns credit: instance_credited = one softplus(D) update per closed conflict window for the active arm.",
+    )
+    parser.add_argument(
+        "--max_conflict_steps",
+        type=int,
+        default=MAX_CONFLICT_STEPS,
+        help="Max conflict-instance window (0 = no cap). time: p+c steps; distance: unmoved steps.",
+    )
+    parser.add_argument(
+        "--max_conflict_steps_type",
+        type=str,
+        default=MAX_CONFLICT_STEPS_TYPE,
+        choices=["time", "distance"],
+        help="How max_conflict_steps is measured for forced instance splits.",
+    )
     return parser
+
+
+def _agent_moved(prev_position: list[int], new_position: list[int]) -> bool:
+    return prev_position[0] != new_position[0] or prev_position[1] != new_position[1]
 
 
 def _macro_action_sequence(conflict_action_name: str, expert_action: int, obs: np.ndarray) -> list[int]:
@@ -526,6 +658,8 @@ def _macro_action_sequence(conflict_action_name: str, expert_action: int, obs: n
         raise ValueError("priority_swap_n3 must be resolved jointly at step level")
     if conflict_action_name == "pass_food_n3":
         raise ValueError("pass_food_n3 must be resolved jointly at step level")
+    if conflict_action_name == "freeze_tag":
+        raise ValueError("freeze_tag must be resolved jointly at step level")
     raise ValueError(f"Unknown conflict action name: {conflict_action_name}")
 
 
@@ -542,32 +676,219 @@ def _canonical_conflict_action_name(action_name: str) -> str:
     return action_name
 
 
-def _bandit_reward_from_episode(
+def baseline_bandit_arms_tuple(bandit_conflict_arms_csv: str) -> tuple[str, ...]:
+    if bandit_conflict_arms_csv.strip() == "":
+        return tuple(CONFLICT_ACTION_NAMES)
+    parsed: list[str] = []
+    for raw in bandit_conflict_arms_csv.split(","):
+        token = raw.strip()
+        if token == "":
+            continue
+        name = _canonical_conflict_action_name(token)
+        if name not in CONFLICT_ACTION_NAMES:
+            raise ValueError(f"Unknown bandit conflict arm '{token}' (canonical '{name}'). Valid: {CONFLICT_ACTION_NAMES}")
+        parsed.append(name)
+    uniq = tuple(dict.fromkeys(parsed))
+    if len(uniq) < 2:
+        raise ValueError(f"bandit_conflict_arms must name at least 2 distinct macros; got {list(uniq)}")
+    return uniq
+
+
+def _dr_softplus(x: float) -> float:
+    x = float(x)
+    if x > 20.0:
+        return x
+    if x < -20.0:
+        return float(np.exp(x))
+    return float(np.log1p(np.exp(x)))
+
+
+def _bandit_dr_delta_raw(
     model_name: str,
     *,
-    full_duration: float,
     team_utility_mean: float,
     own_p_mean: float,
 ) -> float:
+    fd = float(FULL_DURATION_NORM)
     if model_name == "solver_allc":
         return 0.0
     if model_name == "solver_allp":
-        return float(full_duration)
+        return fd
     if model_name == "solver_allsame":
         return float(team_utility_mean)
     if model_name == "neutral_allc":
         return float(-own_p_mean)
     if model_name == "neutral_allp":
-        return float(full_duration - own_p_mean)
+        return float(fd - own_p_mean)
     if model_name == "neutral_allsame":
         return float(team_utility_mean - own_p_mean)
     if model_name == "causer_allc":
-        return float(-full_duration)
+        return float(-fd)
     if model_name == "causer_allp":
         return 0.0
     if model_name == "causer_allsame":
-        return float(team_utility_mean - full_duration)
+        return float(team_utility_mean - fd)
     raise ValueError(f"Unknown bandit_reward_model: {model_name}")
+
+
+def _bandit_reward_from_episode(
+    model_name: str,
+    *,
+    team_utility_mean: float,
+    own_p_mean: float,
+) -> float:
+    return _dr_softplus(
+        _bandit_dr_delta_raw(
+            model_name,
+            team_utility_mean=team_utility_mean,
+            own_p_mean=own_p_mean,
+        )
+    )
+
+
+def _new_episode_arm_stats(agent_ids: list[str], arm_names: tuple[str, ...]) -> dict[str, dict[str, dict[str, list[float]]]]:
+    return {
+        agent_id: {arm_name: {"own_p": [], "team_util": []} for arm_name in arm_names}
+        for agent_id in agent_ids
+    }
+
+
+def _mean_arm_stat(samples: list[float]) -> float:
+    return float(np.mean(samples))
+
+
+def _record_closed_conflict_instance(
+    *,
+    closed: ClosedConflictInstance,
+    episode_own_p_samples: list[float],
+    episode_own_c_samples: list[float],
+    episode_team_utility_samples: list[float],
+    episode_own_p_by_agent: dict[str, list[float]],
+    episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]] | None,
+    agent_id: str,
+    arm_name: str | None,
+):
+    episode_own_p_samples.append(closed.p_norm)
+    episode_own_c_samples.append(closed.c_norm)
+    episode_team_utility_samples.append(closed.team_util_norm)
+    episode_own_p_by_agent[agent_id].append(closed.p_norm)
+    if episode_arm_stats is not None and arm_name is not None:
+        episode_arm_stats[agent_id][arm_name]["own_p"].append(closed.p_norm)
+        episode_arm_stats[agent_id][arm_name]["team_util"].append(closed.team_util_norm)
+
+
+def _credit_bandit_conflict_instance(
+    *,
+    bandits: dict[str, UCB1Bandit],
+    bandit_arm_names: tuple[str, ...],
+    bandit_reward_model: str,
+    agent_id: str,
+    arm_name: str,
+    closed: ClosedConflictInstance,
+):
+    arm_idx = bandit_arm_names.index(arm_name)
+    reward = _bandit_reward_from_episode(
+        bandit_reward_model,
+        team_utility_mean=closed.team_util_norm,
+        own_p_mean=closed.p_norm,
+    )
+    bandits[agent_id].update(arm_idx, reward)
+
+
+def _handle_closed_conflict_instance(
+    *,
+    closed: ClosedConflictInstance,
+    episode_own_p_samples: list[float],
+    episode_own_c_samples: list[float],
+    episode_team_utility_samples: list[float],
+    episode_own_p_by_agent: dict[str, list[float]],
+    episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]] | None,
+    agent_id: str,
+    arm_name: str | None,
+    bandits: dict[str, UCB1Bandit] | None = None,
+    bandit_arm_names: tuple[str, ...] | None = None,
+    bandit_reward_model: str | None = None,
+    bandit_credit_mode: str | None = None,
+):
+    _record_closed_conflict_instance(
+        closed=closed,
+        episode_own_p_samples=episode_own_p_samples,
+        episode_own_c_samples=episode_own_c_samples,
+        episode_team_utility_samples=episode_team_utility_samples,
+        episode_own_p_by_agent=episode_own_p_by_agent,
+        episode_arm_stats=episode_arm_stats,
+        agent_id=agent_id,
+        arm_name=arm_name,
+    )
+    if (
+        bandits is not None
+        and bandit_arm_names is not None
+        and bandit_reward_model is not None
+        and bandit_credit_mode == "instance_credited"
+        and arm_name is not None
+    ):
+        _credit_bandit_conflict_instance(
+            bandits=bandits,
+            bandit_arm_names=bandit_arm_names,
+            bandit_reward_model=bandit_reward_model,
+            agent_id=agent_id,
+            arm_name=arm_name,
+            closed=closed,
+        )
+
+
+def _apply_bandit_episode_updates(
+    *,
+    bandits: dict[str, UCB1Bandit],
+    bandit_arm_names: tuple[str, ...],
+    bandit_reward_model: str,
+    bandit_credit_mode: str,
+    episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]],
+    conflict_trackers_by_env: list[dict[str, ConflictInstanceTracker]],
+    agent_ids: list[str],
+):
+    team_utility_mean_episode = episode_mean_team_util_norm_all_envs(conflict_trackers_by_env, agent_ids)
+    if bandit_credit_mode == "episode_shared":
+        own_p_mean_episode = episode_mean_own_p_norm_all_envs(conflict_trackers_by_env, agent_ids)
+        reward_for_update = _bandit_reward_from_episode(
+            bandit_reward_model,
+            team_utility_mean=team_utility_mean_episode,
+            own_p_mean=own_p_mean_episode,
+        )
+        for agent_id in agent_ids:
+            for arm_idx, arm_name in enumerate(bandit_arm_names):
+                if len(episode_arm_stats[agent_id][arm_name]["own_p"]) > 0:
+                    bandits[agent_id].update(arm_idx, reward_for_update)
+        return
+
+    for agent_id in agent_ids:
+        own_p_episode = float(
+            np.mean([conflict_trackers_by_env[env_idx][agent_id].mean_closed_p_norm() for env_idx in range(len(conflict_trackers_by_env))])
+        )
+        for arm_idx, arm_name in enumerate(bandit_arm_names):
+            arm_samples = episode_arm_stats[agent_id][arm_name]
+            if len(arm_samples["own_p"]) == 0:
+                continue
+            own_p_k = _mean_arm_stat(arm_samples["own_p"])
+            if bandit_credit_mode == "per_arm_credited":
+                team_k = _mean_arm_stat(arm_samples["team_util"])
+                reward_k = _bandit_reward_from_episode(
+                    bandit_reward_model,
+                    team_utility_mean=team_k,
+                    own_p_mean=own_p_k,
+                )
+            elif bandit_credit_mode == "arm_relative_my_role":
+                delta = _bandit_dr_delta_raw(
+                    bandit_reward_model,
+                    team_utility_mean=team_utility_mean_episode,
+                    own_p_mean=own_p_episode,
+                )
+                if bandit_reward_model.startswith("neutral_"):
+                    delta += float(own_p_episode - own_p_k)
+                reward_k = _dr_softplus(delta)
+            else:
+                raise ValueError(f"Unsupported bandit_credit_mode in episode update: {bandit_credit_mode}")
+            bandits[agent_id].update(arm_idx, reward_k)
 
 
 def _expert_actions_for_requests(
@@ -596,6 +917,7 @@ def _run_baseline(args):
     if args.expert_checkpoint is None:
         raise ValueError("--expert_checkpoint is required for baseline modes")
 
+    suppress_collision = args.baseline_mode == "collision_free"
     envs = [
         RationalSwarmForagingEnv(
             n_agents=n_agents,
@@ -603,14 +925,19 @@ def _run_baseline(args):
             num_food=num_food,
             local_grid_size=local_grid_size,
             render_mode=None,
+            suppress_agent_collision=suppress_collision,
         )
         for _ in range(num_envs)
     ]
     env0 = envs[0]
     expert = FrozenTaskExpert(obs_dim=OBS_DIM, checkpoint_path=args.expert_checkpoint, n_actions=N_ACTIONS_FULL, hidden_dim=64)
+    bandit_arm_names: tuple[str, ...] = tuple(CONFLICT_ACTION_NAMES)
     bandits = {}
     if args.baseline_mode == "bandit_ucb1":
-        bandits = {agent_id: UCB1Bandit(n_arms=len(CONFLICT_ACTION_NAMES)) for agent_id in env0.possible_agents}
+        bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
+        bandits = {
+            agent_id: UCB1Bandit(n_arms=len(bandit_arm_names)) for agent_id in env0.possible_agents
+        }
     arm_counts = {name: 0 for name in CONFLICT_ACTION_NAMES}
 
     episode_metrics = []
@@ -630,6 +957,15 @@ def _run_baseline(args):
         episode_own_c_samples = []
         episode_conflict_samples = []
         episode_team_utility_samples = []
+        episode_own_p_by_agent = {agent_id: [] for agent_id in env0.possible_agents}
+        episode_arm_stats = _new_episode_arm_stats(env0.possible_agents, bandit_arm_names)
+        conflict_trackers = [
+            new_conflict_trackers(env0.possible_agents, args.max_conflict_steps, args.max_conflict_steps_type)
+            for _ in range(num_envs)
+        ]
+        active_conflict_arm = [
+            {agent_id: None for agent_id in env0.possible_agents} for _ in range(num_envs)
+        ]
         episode_env_reward_raw = 0.0
         step_count = 0
         episode_arm_counts = {name: 0 for name in CONFLICT_ACTION_NAMES}
@@ -655,11 +991,14 @@ def _run_baseline(args):
                 reserve_escape_selected = set()
                 priority_selected = set()
                 pass_food_selected = set()
+                freeze_selected = set()
                 for agent_id in env0.possible_agents:
                     if len(macro_queues[env_idx][agent_id]) > 0:
                         low_action = macro_queues[env_idx][agent_id].pop(0)
                         selected_is_c[env_idx][agent_id] = True
                         env_actions[env_idx][agent_id] = int(low_action)
+                        if args.baseline_mode == "bandit_ucb1" and active_conflict_arm[env_idx][agent_id] is None:
+                            raise ValueError("macro queue active without bandit conflict arm")
                         continue
                     if not prev_conflict_flags[env_idx][agent_id]:
                         if token_remaining[env_idx][agent_id] > 0:
@@ -667,6 +1006,7 @@ def _run_baseline(args):
                         expert_action = expert_actions[(env_idx, agent_id)]
                         env_actions[env_idx][agent_id] = expert_action
                         selected_is_c[env_idx][agent_id] = False
+                        active_conflict_arm[env_idx][agent_id] = None
                         continue
                     if token_remaining[env_idx][agent_id] > 0:
                         token_remaining[env_idx][agent_id] -= 1
@@ -680,10 +1020,14 @@ def _run_baseline(args):
                     elif args.baseline_mode == "fixed_conflict":
                         action_name = args.fixed_conflict_action
                     elif args.baseline_mode == "bandit_ucb1":
-                        action_name = _arm_to_name(bandits[agent_id].select_arm())
+                        selected_arm_idx = int(bandits[agent_id].select_arm())
+                        action_name = bandit_arm_names[selected_arm_idx]
+                        active_conflict_arm[env_idx][agent_id] = action_name
                     else:
                         raise ValueError(f"Unsupported baseline_mode: {args.baseline_mode}")
                     action_name = _canonical_conflict_action_name(action_name)
+                    if args.baseline_mode == "bandit_ucb1":
+                        active_conflict_arm[env_idx][agent_id] = action_name
                     arm_counts[action_name] += 1
                     episode_arm_counts[action_name] += 1
                     selected_is_c[env_idx][agent_id] = True
@@ -702,6 +1046,9 @@ def _run_baseline(args):
                     if action_name == "pass_food_n3":
                         pass_food_selected.add(agent_id)
                         continue
+                    if action_name == "freeze_tag":
+                        freeze_selected.add(agent_id)
+                        continue
                     expert_action = expert_actions[(env_idx, agent_id)]
                     seq = _macro_action_sequence(action_name, expert_action, obs_list[env_idx][agent_id])
                     macro_queues[env_idx][agent_id] = seq[1:]
@@ -712,6 +1059,15 @@ def _run_baseline(args):
                         low_actions=env_actions[env_idx],
                         macro_queues=macro_queues[env_idx],
                         headings=headings[env_idx],
+                        positions=prev_positions_list[env_idx],
+                    )
+                if len(freeze_selected) > 0:
+                    resolve_freeze_tag_step(
+                        freeze_selected=freeze_selected,
+                        env=envs[env_idx],
+                        expert_actions_subset={aid: expert_actions[(env_idx, aid)] for aid in freeze_selected},
+                        low_actions=env_actions[env_idx],
+                        macro_queues=macro_queues[env_idx],
                         positions=prev_positions_list[env_idx],
                     )
                 if len(reserve_selected) > 0:
@@ -768,19 +1124,57 @@ def _run_baseline(args):
                 next_obs_list.append(next_obs)
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
-                for agent_id in env0.possible_agents:
-                    is_c = float(selected_is_c[env_idx][agent_id])
-                    episode_own_c_samples.append(is_c)
-                    episode_own_p_samples.append(float(1.0 - is_c))
-                    has_conflict = float(infos[agent_id]["n_local"] > 1.0)
-                    episode_conflict_samples.append(has_conflict)
-                    prev_conflict_flags[env_idx][agent_id] = bool(has_conflict)
                 team_utility = sum(
-                    float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"])
+                    float(infos[agent_id]["p_t"]) - (0*float(infos[agent_id]["c_t"])) #testing zeroed out C
                     for agent_id in env0.possible_agents
                 )
                 episode_team_utility_samples.append(float(team_utility))
                 new_positions = {a: list(envs[env_idx].agent_positions[a]) for a in env0.possible_agents}
+                for agent_id in env0.possible_agents:
+                    is_c = float(selected_is_c[env_idx][agent_id])
+                    if args.baseline_mode == "collision_free":
+                        episode_conflict_samples.append(0.0)
+                        prev_conflict_flags[env_idx][agent_id] = False
+                    else:
+                        has_conflict = float(infos[agent_id]["n_local"] > 1.0)
+                        episode_conflict_samples.append(has_conflict)
+                        prev_conflict_flags[env_idx][agent_id] = bool(has_conflict)
+                    tracker = conflict_trackers[env_idx][agent_id]
+                    closed = tracker.step(
+                        p_t=float(infos[agent_id]["p_t"]),
+                        c_t=float(infos[agent_id]["c_t"]),
+                        team_util=float(team_utility),
+                        n_local=float(infos[agent_id]["n_local"]),
+                        new_conflict_event=float(infos[agent_id]["new_conflict_event"]),
+                        agent_moved=_agent_moved(prev_positions_list[env_idx][agent_id], new_positions[agent_id]),
+                    )
+                    arm_name = active_conflict_arm[env_idx][agent_id]
+                    if closed is not None:
+                        _handle_closed_conflict_instance(
+                            closed=closed,
+                            episode_own_p_samples=episode_own_p_samples,
+                            episode_own_c_samples=episode_own_c_samples,
+                            episode_team_utility_samples=episode_team_utility_samples,
+                            episode_own_p_by_agent=episode_own_p_by_agent,
+                            episode_arm_stats=episode_arm_stats if args.baseline_mode == "bandit_ucb1" else None,
+                            agent_id=agent_id,
+                            arm_name=arm_name,
+                            bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
+                            bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
+                            bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
+                            bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
+                        )
+                    if args.baseline_mode == "bandit_ucb1":
+                        if arm_name is not None and tracker.active and args.bandit_credit_mode == "step_level":
+                            arm_idx = bandit_arm_names.index(arm_name)
+                            reward_step = _bandit_reward_from_episode(
+                                args.bandit_reward_model,
+                                team_utility_mean=tracker.running_team_util_norm(),
+                                own_p_mean=tracker.running_p_norm(),
+                            )
+                            bandits[agent_id].update(arm_idx, reward_step)
+                        if len(macro_queues[env_idx][agent_id]) == 0:
+                            active_conflict_arm[env_idx][agent_id] = None
                 update_headings_from_step(headings[env_idx], prev_positions_list[env_idx], new_positions, env_actions[env_idx])
             obs_list = next_obs_list
             step_count += 1
@@ -790,25 +1184,45 @@ def _run_baseline(args):
         episode_env_rewards_raw.append(float(episode_env_reward_raw))
         eps = 0.0
 
-        if args.baseline_mode == "bandit_ucb1":
-            team_utility_mean = float(np.mean(episode_team_utility_samples))
-            own_p_mean = float(np.mean(episode_own_p_samples))
-            reward_for_update = _bandit_reward_from_episode(
-                args.bandit_reward_model,
-                full_duration=float(max_steps),
-                team_utility_mean=team_utility_mean,
-                own_p_mean=own_p_mean,
-            )
+        for env_idx in range(num_envs):
             for agent_id in env0.possible_agents:
-                total_selected = sum(episode_arm_counts.values())
-                if total_selected > 0:
-                    for arm_idx, arm_name in enumerate(CONFLICT_ACTION_NAMES):
-                        if episode_arm_counts[arm_name] > 0:
-                            bandits[agent_id].update(arm_idx, reward_for_update)
+                closed = conflict_trackers[env_idx][agent_id].finalize_episode()
+                if closed is not None:
+                    _handle_closed_conflict_instance(
+                        closed=closed,
+                        episode_own_p_samples=episode_own_p_samples,
+                        episode_own_c_samples=episode_own_c_samples,
+                        episode_team_utility_samples=episode_team_utility_samples,
+                        episode_own_p_by_agent=episode_own_p_by_agent,
+                        episode_arm_stats=episode_arm_stats if args.baseline_mode == "bandit_ucb1" else None,
+                        agent_id=agent_id,
+                        arm_name=active_conflict_arm[env_idx][agent_id],
+                        bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
+                        bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
+                        bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
+                        bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
+                    )
 
+        if args.baseline_mode == "bandit_ucb1" and args.bandit_credit_mode not in ("step_level", "instance_credited"):
+            _apply_bandit_episode_updates(
+                bandits=bandits,
+                bandit_arm_names=bandit_arm_names,
+                bandit_reward_model=args.bandit_reward_model,
+                bandit_credit_mode=args.bandit_credit_mode,
+                episode_arm_stats=episode_arm_stats,
+                conflict_trackers_by_env=conflict_trackers,
+                agent_ids=env0.possible_agents,
+            )
+
+        bandit_method_suffix = (
+            f"{args.bandit_reward_model}_{args.bandit_credit_mode}"
+            if args.baseline_mode == "bandit_ucb1"
+            else ""
+        )
         metric_row = {
             "episode": episode + 1,
-            "method": args.baseline_mode if args.baseline_mode != "bandit_ucb1" else f"bandit_ucb1_{args.bandit_reward_model}",
+            "method": args.baseline_mode if args.baseline_mode != "bandit_ucb1" else f"bandit_ucb1_{bandit_method_suffix}",
+            "bandit_credit_mode": args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else "",
             "n_agents": float(n_agents),
             "avg_env_reward_last_50": float(np.mean(episode_env_rewards[-50:])),
             "episode_env_reward": float(episode_env_reward),
@@ -841,19 +1255,17 @@ def _run_baseline(args):
             "arm_reserve_parity_escape_count": float(arm_counts["reserve_parity_escape"]),
             "arm_priority_swap_n3_count": float(arm_counts["priority_swap_n3"]),
             "arm_pass_food_n3_count": float(arm_counts["pass_food_n3"]),
+            "arm_freeze_tag_count": float(arm_counts["freeze_tag"]),
         }
         if args.baseline_mode == "bandit_ucb1":
             probs = np.mean(np.stack([bandits[a].arm_probabilities() for a in env0.possible_agents], axis=0), axis=0)
-            metric_row["arm_wait3_prob"] = float(probs[0])
-            metric_row["arm_backward3_prob"] = float(probs[1])
-            metric_row["arm_randomwalk3_prob"] = float(probs[2])
-            metric_row["arm_wait2_forward1_prob"] = float(probs[3])
-            metric_row["arm_move_clear_prob"] = float(probs[4])
-            metric_row["arm_handshake_prob"] = float(probs[5])
-            metric_row["arm_reserve_parity_prob"] = float(probs[6])
-            metric_row["arm_reserve_parity_escape_prob"] = float(probs[7])
-            metric_row["arm_priority_swap_n3_prob"] = float(probs[8])
-            metric_row["arm_pass_food_n3_prob"] = float(probs[9])
+            values = np.mean(np.stack([bandits[a].values for a in env0.possible_agents], axis=0), axis=0)
+            for name in CONFLICT_ACTION_NAMES:
+                metric_row[f"arm_{name}_prob"] = np.nan
+                metric_row[f"arm_{name}_value"] = np.nan
+            for arm_idx, name in enumerate(bandit_arm_names):
+                metric_row[f"arm_{name}_prob"] = float(probs[arm_idx])
+                metric_row[f"arm_{name}_value"] = float(values[arm_idx])
         else:
             metric_row["arm_wait3_prob"] = np.nan
             metric_row["arm_backward3_prob"] = np.nan
@@ -865,6 +1277,9 @@ def _run_baseline(args):
             metric_row["arm_reserve_parity_escape_prob"] = np.nan
             metric_row["arm_priority_swap_n3_prob"] = np.nan
             metric_row["arm_pass_food_n3_prob"] = np.nan
+            metric_row["arm_freeze_tag_prob"] = np.nan
+            for name in CONFLICT_ACTION_NAMES:
+                metric_row[f"arm_{name}_value"] = np.nan
         episode_metrics.append(metric_row)
 
         if (episode + 1) % 50 == 0:
@@ -972,7 +1387,7 @@ def run_training(args):
                 lr=args.dr_lr,
                 hidden_dim=64,
                 entropy_coef=args.dr_entropy_coef,
-                full_duration=float(max_steps),
+                full_duration=float(FULL_DURATION_NORM),
                 my_mean_mode=args.dr_my_mean_mode,
             )
             for agent_id in env0.possible_agents
@@ -991,6 +1406,12 @@ def run_training(args):
         episode_own_p_samples = []
         episode_own_c_samples = []
         episode_conflict_samples = []
+        episode_team_utility_samples = []
+        conflict_trackers = [
+            new_conflict_trackers(env0.possible_agents, args.max_conflict_steps, args.max_conflict_steps_type)
+            for _ in range(num_envs)
+        ]
+        episode_own_p_by_agent = {agent_id: [] for agent_id in env0.possible_agents}
         task_macro_queues = [{agent_id: [] for agent_id in env0.possible_agents} for _ in range(num_envs)]
         task_macro_current_hi = [{agent_id: 0 for agent_id in env0.possible_agents} for _ in range(num_envs)]
         task_headings = [{agent_id: 0 for agent_id in env0.possible_agents} for _ in range(num_envs)]
@@ -998,10 +1419,10 @@ def run_training(args):
         episode_env_reward_raw = 0.0
         step_count = 0
         while step_count < max_steps:
+            prev_positions_list = [{a: list(envs[e].agent_positions[a]) for a in env0.possible_agents} for e in range(num_envs)]
             if mode == "task_avoid":
                 actions_hi_list = [{} for _ in range(num_envs)]
                 actions_low_list = [{} for _ in range(num_envs)]
-                prev_positions_list = [{a: list(envs[e].agent_positions[a]) for a in env0.possible_agents} for e in range(num_envs)]
                 expert_requests: list[tuple[int, str]] = []
                 for agent_id in env0.possible_agents:
                     policy = policies[agent_id]
@@ -1127,25 +1548,84 @@ def run_training(args):
                 truncations_list.append(truncations)
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
-                if mode == "task_avoid":
-                    new_positions = {a: list(envs[env_idx].agent_positions[a]) for a in env0.possible_agents}
-                    update_headings_from_step(task_headings[env_idx], prev_positions_list[env_idx], new_positions, env_actions[env_idx])
+
+            new_positions_list = [
+                {a: list(envs[e].agent_positions[a]) for a in env0.possible_agents} for e in range(num_envs)
+            ]
+            if mode == "task_avoid":
+                for env_idx in range(num_envs):
+                    update_headings_from_step(
+                        task_headings[env_idx],
+                        prev_positions_list[env_idx],
+                        new_positions_list[env_idx],
+                        env_actions[env_idx],
+                    )
 
             team_utility_batch = np.array(
                 [sum(float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"]) for agent_id in env0.possible_agents) for infos in infos_list],
                 dtype=np.float32,
             )
+            for env_idx in range(num_envs):
+                team_util = float(team_utility_batch[env_idx])
+                for agent_id in env0.possible_agents:
+                    agent_info = infos_list[env_idx][agent_id]
+                    closed = conflict_trackers[env_idx][agent_id].step(
+                        p_t=float(agent_info["p_t"]),
+                        c_t=float(agent_info["c_t"]),
+                        team_util=team_util,
+                        n_local=float(agent_info["n_local"]),
+                        new_conflict_event=float(agent_info["new_conflict_event"]),
+                        agent_moved=_agent_moved(
+                            prev_positions_list[env_idx][agent_id],
+                            new_positions_list[env_idx][agent_id],
+                        ),
+                    )
+                    if closed is not None:
+                        _record_closed_conflict_instance(
+                            closed=closed,
+                            episode_own_p_samples=episode_own_p_samples,
+                            episode_own_c_samples=episode_own_c_samples,
+                            episode_team_utility_samples=episode_team_utility_samples,
+                            episode_own_p_by_agent=episode_own_p_by_agent,
+                            episode_arm_stats=None,
+                            agent_id=agent_id,
+                            arm_name=None,
+                        )
+
             truncated = (step_count + 1) >= max_steps
             for agent_id in env0.possible_agents:
                 policy = policies[agent_id]
                 critic = critics[agent_id]
                 obs_batch = np.array([obs_list[e][agent_id] for e in range(num_envs)], dtype=np.float32)
                 next_obs_batch = np.array([next_obs_list[e][agent_id] for e in range(num_envs)], dtype=np.float32)
-                own_p_batch = np.array([float(infos_list[e][agent_id]["p_t"]) for e in range(num_envs)], dtype=np.float32)
-                own_c_batch = np.array([float(infos_list[e][agent_id]["c_t"]) for e in range(num_envs)], dtype=np.float32)
+                own_p_batch = np.array(
+                    [
+                        conflict_trackers[e][agent_id].running_p_norm()
+                        if conflict_trackers[e][agent_id].active
+                        else 0.0
+                        for e in range(num_envs)
+                    ],
+                    dtype=np.float32,
+                )
+                own_c_batch = np.array(
+                    [
+                        conflict_trackers[e][agent_id].running_c_norm()
+                        if conflict_trackers[e][agent_id].active
+                        else 0.0
+                        for e in range(num_envs)
+                    ],
+                    dtype=np.float32,
+                )
+                team_utility_norm_batch = np.array(
+                    [
+                        conflict_trackers[e][agent_id].running_team_util_norm()
+                        if conflict_trackers[e][agent_id].active
+                        else 0.0
+                        for e in range(num_envs)
+                    ],
+                    dtype=np.float32,
+                )
                 n_local_batch = np.array([float(infos_list[e][agent_id]["n_local"]) for e in range(num_envs)], dtype=np.float32)
-                episode_own_p_samples.extend(own_p_batch.tolist())
-                episode_own_c_samples.extend(own_c_batch.tolist())
                 episode_conflict_samples.extend((n_local_batch > 1.0).astype(np.float32).tolist())
 
                 if args.reward_mode == "mean_DR":
@@ -1154,22 +1634,43 @@ def run_training(args):
                 else:
                     reward_batch, _dr_eval = dr_learners[agent_id].reward_batch(
                         obs_batch=obs_batch,
-                        team_utility_batch=team_utility_batch,
+                        team_utility_batch=team_utility_norm_batch,
                         own_p_batch=own_p_batch,
                         own_c_batch=own_c_batch,
                     )
-                    episode_train_inputs[agent_id]["obs"].extend(obs_batch)
-                    episode_train_inputs[agent_id]["team_utility"].extend(team_utility_batch.tolist())
-                    episode_train_inputs[agent_id]["own_p"].extend(own_p_batch.tolist())
-                    episode_train_inputs[agent_id]["own_c"].extend(own_c_batch.tolist())
+                    active_envs = [env_idx for env_idx in range(num_envs) if conflict_trackers[env_idx][agent_id].active]
+                    episode_train_inputs[agent_id]["obs"].extend(obs_batch[active_envs])
+                    episode_train_inputs[agent_id]["team_utility"].extend(team_utility_norm_batch[active_envs].tolist())
+                    episode_train_inputs[agent_id]["own_p"].extend(own_p_batch[active_envs].tolist())
+                    episode_train_inputs[agent_id]["own_c"].extend(own_c_batch[active_envs].tolist())
 
                 for env_idx in range(num_envs):
-                    critic.store(obs_list[env_idx][agent_id], float(own_p_batch[env_idx]), float(own_c_batch[env_idx]), next_obs_list[env_idx][agent_id])
+                    critic.store(
+                        obs_list[env_idx][agent_id],
+                        float(infos_list[env_idx][agent_id]["p_t"]),
+                        float(infos_list[env_idx][agent_id]["c_t"]),
+                        next_obs_list[env_idx][agent_id],
+                    )
                     done = terminations_list[env_idx][agent_id] or truncations_list[env_idx][agent_id] or truncated
                     policy.store(obs_list[env_idx][agent_id], int(actor_actions[env_idx][agent_id]), float(reward_batch[env_idx]), next_obs_list[env_idx][agent_id], done)
 
             obs_list = next_obs_list
             step_count += 1
+
+        for env_idx in range(num_envs):
+            for agent_id in env0.possible_agents:
+                closed = conflict_trackers[env_idx][agent_id].finalize_episode()
+                if closed is not None:
+                    _record_closed_conflict_instance(
+                        closed=closed,
+                        episode_own_p_samples=episode_own_p_samples,
+                        episode_own_c_samples=episode_own_c_samples,
+                        episode_team_utility_samples=episode_team_utility_samples,
+                        episode_own_p_by_agent=episode_own_p_by_agent,
+                        episode_arm_stats=None,
+                        agent_id=agent_id,
+                        arm_name=None,
+                    )
 
         episode_env_reward = float(episode_env_reward_raw / num_envs)
         episode_env_rewards_raw.append(float(episode_env_reward_raw))
@@ -1251,6 +1752,7 @@ def run_training(args):
             "arm_reserve_parity_escape_count": np.nan,
             "arm_priority_swap_n3_count": np.nan,
             "arm_pass_food_n3_count": np.nan,
+            "arm_freeze_tag_count": np.nan,
             "arm_wait3_prob": np.nan,
             "arm_backward3_prob": np.nan,
             "arm_randomwalk3_prob": np.nan,
@@ -1261,6 +1763,7 @@ def run_training(args):
             "arm_reserve_parity_escape_prob": np.nan,
             "arm_priority_swap_n3_prob": np.nan,
             "arm_pass_food_n3_prob": np.nan,
+            "arm_freeze_tag_prob": np.nan,
         }
         episode_metrics.append(metric_row)
         if (episode + 1) % 50 == 0:
@@ -1304,7 +1807,7 @@ def run_training(args):
                 "running_own_p_sum": float(learner.running_own_p_sum),
                 "running_own_p_count": int(learner.running_own_p_count),
             }
-        meta = {"full_duration": float(max_steps), "agents": per_agent_meta}
+        meta = {"full_duration": float(FULL_DURATION_NORM), "agents": per_agent_meta}
         meta_path = artifacts_dir / "dr_mixture_meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)

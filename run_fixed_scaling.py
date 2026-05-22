@@ -85,6 +85,7 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         "arm_reserve_parity_escape_prob",
         "arm_priority_swap_n3_prob",
         "arm_pass_food_n3_prob",
+        "arm_freeze_tag_prob",
     ]
     if task["resume"]:
         resumed_last = _load_last_row_if_complete(
