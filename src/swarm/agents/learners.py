@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 
 from .device import DEVICE
-from .networks import QNetwork, PCCritic, DRScenarioMixtureNet
-from .replay import ReplayBuffer, CriticReplayBuffer
+from .networks import QNetwork, PCCritic, DRScenarioMixtureNet, DRUCBPolicyNet
+from .replay import ReplayBuffer, CriticReplayBuffer, MetaPolicyReplayBuffer
 
 
 def _is_cuda_overflow_error(exc: RuntimeError) -> bool:
@@ -358,4 +358,53 @@ class UCB1Bandit:
         if self.total_pulls == 0:
             return np.zeros(self.n_arms, dtype=np.float64)
         return self.counts.astype(np.float64) / float(self.total_pulls)
+
+
+class DRUCBPolicyLearner:
+    def __init__(
+        self,
+        obs_dim: int,
+        n_dr_experts: int,
+        lr: float = 1e-3,
+        hidden_dim: int = 64,
+        buffer_size: int = 10_000,
+        batch_size: int = 32,
+    ):
+        self.batch_size = batch_size
+        self.n_dr_experts = n_dr_experts
+        self.net, self.device = _safe_module_to_device(
+            DRUCBPolicyNet(obs_dim, n_dr_experts, hidden_dim), DEVICE, "DRUCBPolicyLearner.net"
+        )
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.buffer = MetaPolicyReplayBuffer(buffer_size)
+        self.last_loss: float | None = None
+
+    def select_dr(self, obs: np.ndarray) -> tuple[int, float]:
+        with torch.no_grad():
+            x = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            logits = self.net(x).squeeze(0)
+            probs = torch.softmax(logits, dim=0).cpu().numpy()
+        dr_idx = int(np.random.choice(self.n_dr_experts, p=probs))
+        log_prob = float(np.log(probs[dr_idx]))
+        return dr_idx, log_prob
+
+    def store(self, obs: np.ndarray, dr_idx: int, reward: float):
+        self.buffer.push(obs, dr_idx, reward)
+
+    def train_step(self) -> float | None:
+        if len(self.buffer) < self.batch_size:
+            return None
+        obs, dr_idxs, rewards = self.buffer.sample(self.batch_size)
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        dr_idxs_t = torch.tensor(dr_idxs, dtype=torch.int64, device=self.device)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        logits = self.net(obs_t)
+        log_probs = torch.log_softmax(logits, dim=1)
+        selected_log_probs = log_probs[torch.arange(len(dr_idxs)), dr_idxs_t]
+        loss = -(selected_log_probs * rewards_t).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.last_loss = float(loss.item())
+        return self.last_loss
 

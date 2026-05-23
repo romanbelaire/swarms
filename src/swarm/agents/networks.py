@@ -36,6 +36,21 @@ class PCCritic(nn.Module):
         return p, c
 
 
+class DRUCBPolicyNet(nn.Module):
+    def __init__(self, obs_dim: int, n_dr_experts: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_dr_experts),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.float())
+
+
 class DRScenarioMixtureNet(nn.Module):
     def __init__(self, obs_dim: int, hidden_dim: int = 64):
         super().__init__()

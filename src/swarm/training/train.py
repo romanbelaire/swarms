@@ -22,7 +22,7 @@ from swarm.conflict_instances import (
     episode_mean_team_util_norm_all_envs,
     new_conflict_trackers,
 )
-from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit
+from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit, DRUCBPolicyLearner
 from swarm.config import (
     N_EPISODES,
     MAX_STEPS_PER_EPISODE,
@@ -581,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--baseline_mode",
         type=str,
         default="none",
-        choices=["none", "bandit_ucb1", "random_conflict", "fixed_conflict", "collision_free"],
+        choices=["none", "bandit_ucb1", "dr_ucb_mixture", "random_conflict", "fixed_conflict", "collision_free"],
         help="Ablation baseline mode. 'none' runs learned DQN pipeline. "
         "'collision_free' runs expert-task actions only with inter-agent positional collisions disabled.",
     )
@@ -616,6 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=BANDIT_CREDIT_MODE_NAMES,
         help="How bandit_ucb1 assigns credit: instance_credited = one softplus(D) update per closed conflict window for the active arm.",
     )
+    parser.add_argument("--dr_meta_lr", type=float, default=1e-3, help="Learning rate for dr_ucb_mixture meta-policy MLP.")
+    parser.add_argument("--dr_meta_batch_size", type=int, default=32, help="REINFORCE batch size for dr_ucb_mixture meta-policy.")
     parser.add_argument(
         "--max_conflict_steps",
         type=int,
@@ -795,6 +797,29 @@ def _credit_bandit_conflict_instance(
     bandits[agent_id].update(arm_idx, reward)
 
 
+def _credit_dr_ucb_mixture_instance(
+    *,
+    nested_bandits: dict[str, dict[str, UCB1Bandit]],
+    dr_policies: dict[str, DRUCBPolicyLearner],
+    bandit_arm_names: tuple[str, ...],
+    agent_id: str,
+    arm_name: str,
+    dr_name: str,
+    dr_idx: int,
+    meta_obs: np.ndarray,
+    closed: ClosedConflictInstance,
+) -> float | None:
+    arm_idx = bandit_arm_names.index(arm_name)
+    reward = _bandit_reward_from_episode(
+        dr_name,
+        team_utility_mean=closed.team_util_norm,
+        own_p_mean=closed.p_norm,
+    )
+    nested_bandits[agent_id][dr_name].update(arm_idx, reward)
+    dr_policies[agent_id].store(meta_obs, dr_idx, reward)
+    return dr_policies[agent_id].train_step()
+
+
 def _handle_closed_conflict_instance(
     *,
     closed: ClosedConflictInstance,
@@ -933,10 +958,31 @@ def _run_baseline(args):
     expert = FrozenTaskExpert(obs_dim=OBS_DIM, checkpoint_path=args.expert_checkpoint, n_actions=N_ACTIONS_FULL, hidden_dim=64)
     bandit_arm_names: tuple[str, ...] = tuple(CONFLICT_ACTION_NAMES)
     bandits = {}
+    dr_policies: dict[str, DRUCBPolicyLearner] = {}
     if args.baseline_mode == "bandit_ucb1":
         bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
         bandits = {
             agent_id: UCB1Bandit(n_arms=len(bandit_arm_names)) for agent_id in env0.possible_agents
+        }
+    elif args.baseline_mode == "dr_ucb_mixture":
+        if args.bandit_credit_mode != "instance_credited":
+            raise ValueError("dr_ucb_mixture only supports bandit_credit_mode=instance_credited")
+        bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
+        bandits = {
+            agent_id: {
+                dr_name: UCB1Bandit(n_arms=len(bandit_arm_names))
+                for dr_name in BANDIT_REWARD_MODEL_NAMES
+            }
+            for agent_id in env0.possible_agents
+        }
+        dr_policies = {
+            agent_id: DRUCBPolicyLearner(
+                obs_dim=OBS_DIM,
+                n_dr_experts=len(BANDIT_REWARD_MODEL_NAMES),
+                lr=args.dr_meta_lr,
+                batch_size=args.dr_meta_batch_size,
+            )
+            for agent_id in env0.possible_agents
         }
     arm_counts = {name: 0 for name in CONFLICT_ACTION_NAMES}
 
@@ -966,6 +1012,16 @@ def _run_baseline(args):
         active_conflict_arm = [
             {agent_id: None for agent_id in env0.possible_agents} for _ in range(num_envs)
         ]
+        active_dr_model = [
+            {agent_id: None for agent_id in env0.possible_agents} for _ in range(num_envs)
+        ]
+        active_dr_idx = [
+            {agent_id: None for agent_id in env0.possible_agents} for _ in range(num_envs)
+        ]
+        active_meta_obs = [
+            {agent_id: None for agent_id in env0.possible_agents} for _ in range(num_envs)
+        ]
+        episode_dr_meta_losses: list[float] = []
         episode_env_reward_raw = 0.0
         step_count = 0
         episode_arm_counts = {name: 0 for name in CONFLICT_ACTION_NAMES}
@@ -997,7 +1053,7 @@ def _run_baseline(args):
                         low_action = macro_queues[env_idx][agent_id].pop(0)
                         selected_is_c[env_idx][agent_id] = True
                         env_actions[env_idx][agent_id] = int(low_action)
-                        if args.baseline_mode == "bandit_ucb1" and active_conflict_arm[env_idx][agent_id] is None:
+                        if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") and active_conflict_arm[env_idx][agent_id] is None:
                             raise ValueError("macro queue active without bandit conflict arm")
                         continue
                     if not prev_conflict_flags[env_idx][agent_id]:
@@ -1023,10 +1079,19 @@ def _run_baseline(args):
                         selected_arm_idx = int(bandits[agent_id].select_arm())
                         action_name = bandit_arm_names[selected_arm_idx]
                         active_conflict_arm[env_idx][agent_id] = action_name
+                    elif args.baseline_mode == "dr_ucb_mixture":
+                        dr_idx, _ = dr_policies[agent_id].select_dr(obs_list[env_idx][agent_id])
+                        dr_name = BANDIT_REWARD_MODEL_NAMES[dr_idx]
+                        selected_arm_idx = int(bandits[agent_id][dr_name].select_arm())
+                        action_name = bandit_arm_names[selected_arm_idx]
+                        active_dr_model[env_idx][agent_id] = dr_name
+                        active_dr_idx[env_idx][agent_id] = dr_idx
+                        active_meta_obs[env_idx][agent_id] = obs_list[env_idx][agent_id].copy()
+                        active_conflict_arm[env_idx][agent_id] = action_name
                     else:
                         raise ValueError(f"Unsupported baseline_mode: {args.baseline_mode}")
                     action_name = _canonical_conflict_action_name(action_name)
-                    if args.baseline_mode == "bandit_ucb1":
+                    if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture"):
                         active_conflict_arm[env_idx][agent_id] = action_name
                     arm_counts[action_name] += 1
                     episode_arm_counts[action_name] += 1
@@ -1125,7 +1190,7 @@ def _run_baseline(args):
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
                 team_utility = sum(
-                    float(infos[agent_id]["p_t"]) - (0*float(infos[agent_id]["c_t"])) #testing zeroed out C
+                    float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"])
                     for agent_id in env0.possible_agents
                 )
                 episode_team_utility_samples.append(float(team_utility))
@@ -1156,7 +1221,7 @@ def _run_baseline(args):
                             episode_own_c_samples=episode_own_c_samples,
                             episode_team_utility_samples=episode_team_utility_samples,
                             episode_own_p_by_agent=episode_own_p_by_agent,
-                            episode_arm_stats=episode_arm_stats if args.baseline_mode == "bandit_ucb1" else None,
+                            episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                             agent_id=agent_id,
                             arm_name=arm_name,
                             bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
@@ -1164,6 +1229,20 @@ def _run_baseline(args):
                             bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
                             bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
                         )
+                        if args.baseline_mode == "dr_ucb_mixture" and arm_name is not None:
+                            meta_loss = _credit_dr_ucb_mixture_instance(
+                                nested_bandits=bandits,
+                                dr_policies=dr_policies,
+                                bandit_arm_names=bandit_arm_names,
+                                agent_id=agent_id,
+                                arm_name=arm_name,
+                                dr_name=active_dr_model[env_idx][agent_id],
+                                dr_idx=active_dr_idx[env_idx][agent_id],
+                                meta_obs=active_meta_obs[env_idx][agent_id],
+                                closed=closed,
+                            )
+                            if meta_loss is not None:
+                                episode_dr_meta_losses.append(meta_loss)
                     if args.baseline_mode == "bandit_ucb1":
                         if arm_name is not None and tracker.active and args.bandit_credit_mode == "step_level":
                             arm_idx = bandit_arm_names.index(arm_name)
@@ -1173,8 +1252,13 @@ def _run_baseline(args):
                                 own_p_mean=tracker.running_p_norm(),
                             )
                             bandits[agent_id].update(arm_idx, reward_step)
+                    if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture"):
                         if len(macro_queues[env_idx][agent_id]) == 0:
                             active_conflict_arm[env_idx][agent_id] = None
+                            if args.baseline_mode == "dr_ucb_mixture":
+                                active_dr_model[env_idx][agent_id] = None
+                                active_dr_idx[env_idx][agent_id] = None
+                                active_meta_obs[env_idx][agent_id] = None
                 update_headings_from_step(headings[env_idx], prev_positions_list[env_idx], new_positions, env_actions[env_idx])
             obs_list = next_obs_list
             step_count += 1
@@ -1194,7 +1278,7 @@ def _run_baseline(args):
                         episode_own_c_samples=episode_own_c_samples,
                         episode_team_utility_samples=episode_team_utility_samples,
                         episode_own_p_by_agent=episode_own_p_by_agent,
-                        episode_arm_stats=episode_arm_stats if args.baseline_mode == "bandit_ucb1" else None,
+                        episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                         agent_id=agent_id,
                         arm_name=active_conflict_arm[env_idx][agent_id],
                         bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
@@ -1202,6 +1286,20 @@ def _run_baseline(args):
                         bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
                         bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
                     )
+                    if args.baseline_mode == "dr_ucb_mixture" and active_conflict_arm[env_idx][agent_id] is not None:
+                        meta_loss = _credit_dr_ucb_mixture_instance(
+                            nested_bandits=bandits,
+                            dr_policies=dr_policies,
+                            bandit_arm_names=bandit_arm_names,
+                            agent_id=agent_id,
+                            arm_name=active_conflict_arm[env_idx][agent_id],
+                            dr_name=active_dr_model[env_idx][agent_id],
+                            dr_idx=active_dr_idx[env_idx][agent_id],
+                            meta_obs=active_meta_obs[env_idx][agent_id],
+                            closed=closed,
+                        )
+                        if meta_loss is not None:
+                            episode_dr_meta_losses.append(meta_loss)
 
         if args.baseline_mode == "bandit_ucb1" and args.bandit_credit_mode not in ("step_level", "instance_credited"):
             _apply_bandit_episode_updates(
@@ -1219,10 +1317,16 @@ def _run_baseline(args):
             if args.baseline_mode == "bandit_ucb1"
             else ""
         )
+        if args.baseline_mode == "dr_ucb_mixture":
+            method_label = f"dr_ucb_mixture_{args.bandit_credit_mode}"
+        elif args.baseline_mode == "bandit_ucb1":
+            method_label = f"bandit_ucb1_{bandit_method_suffix}"
+        else:
+            method_label = args.baseline_mode
         metric_row = {
             "episode": episode + 1,
-            "method": args.baseline_mode if args.baseline_mode != "bandit_ucb1" else f"bandit_ucb1_{bandit_method_suffix}",
-            "bandit_credit_mode": args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else "",
+            "method": method_label,
+            "bandit_credit_mode": args.bandit_credit_mode if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else "",
             "n_agents": float(n_agents),
             "avg_env_reward_last_50": float(np.mean(episode_env_rewards[-50:])),
             "episode_env_reward": float(episode_env_reward),
@@ -1237,6 +1341,7 @@ def _run_baseline(args):
             "policy_loss_mean": np.nan,
             "critic_loss_mean": np.nan,
             "dr_loss_mean": np.nan,
+            "dr_meta_loss_mean": float(np.mean(episode_dr_meta_losses)) if len(episode_dr_meta_losses) > 0 else np.nan,
             "dr_mixed_reward_mean": np.nan,
             "u_solver_mean": np.nan,
             "u_neutral_mean": np.nan,
