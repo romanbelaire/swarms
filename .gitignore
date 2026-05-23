@@ -11,8 +11,12 @@ venv/
 .cursor/
 
 # Training artifacts
-artifacts/
+artifacts/*
+!artifacts/expert/
+artifacts/expert/*
+!artifacts/expert/dqn_weights_agent_0.pt
 dqn_weights_*.pt
+!artifacts/expert/dqn_weights_agent_0.pt
 pc_critic_*.pt
 training_metrics*.csv
 training_convergence*.png
