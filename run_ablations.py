@@ -9,6 +9,7 @@ import csv
 import os
 from pathlib import Path
 from types import SimpleNamespace
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent
@@ -34,6 +35,76 @@ def _parse_int_list(raw: str) -> list[int]:
     if len(parsed) == 0:
         raise ValueError("List argument cannot be empty")
     return parsed
+
+
+def _parse_bandit_arm_names(bandit_conflict_arms: str) -> list[str]:
+    arm_names = [name.strip() for name in bandit_conflict_arms.split(",") if name.strip() != ""]
+    if len(arm_names) == 0:
+        raise ValueError("bandit_conflict_arms must list at least one arm for DR ablations")
+    return arm_names
+
+
+BANDIT_DIAGNOSTIC_SUFFIXES = (
+    "prob",
+    "value",
+    "pull_count",
+    "ep_sel_frac",
+    "cum_sel_frac",
+    "reward_mean",
+    "reward_var",
+    "delta_mean",
+    "delta_var",
+    "own_p_mean",
+    "team_util_mean",
+    "team_util_var",
+)
+
+
+def _bandit_diagnostic_column_names(arm_names: list[str]) -> list[str]:
+    return [f"arm_{arm_name}_{suffix}" for arm_name in arm_names for suffix in BANDIT_DIAGNOSTIC_SUFFIXES]
+
+
+def _required_resume_columns(arm_names: list[str] | None) -> list[str]:
+    base = [
+        "episode_env_reward",
+        "avg_env_reward_last_50",
+        "avg_p_time_percent",
+        "avg_c_time_percent",
+        "avg_conflict_percent",
+    ]
+    if arm_names is None:
+        return [
+            *base,
+            "arm_wait3_prob",
+            "arm_backward3_prob",
+            "arm_randomwalk3_prob",
+            "arm_wait2_forward1_prob",
+            "arm_move_clear_prob",
+            "arm_handshake_prob",
+            "arm_reserve_parity_prob",
+            "arm_reserve_parity_escape_prob",
+            "arm_priority_swap_n3_prob",
+            "arm_pass_food_n3_prob",
+            "arm_freeze_tag_prob",
+        ]
+    return [*base, *_bandit_diagnostic_column_names(arm_names)]
+
+
+def _diagnostics_summary_row(
+    task: dict[str, str | int],
+    last: dict[str, float],
+    arm_names: list[str],
+) -> dict[str, float | str | int]:
+    row: dict[str, float | str | int] = {
+        "run_name": str(task["run_name"]),
+        "method": str(task["method"]),
+        "plot_order": int(task["plot_order"]),
+        "n_agents": int(task["n_agents"]),
+        "seed": int(task["seed"]),
+    }
+    for col in _bandit_diagnostic_column_names(arm_names):
+        row[col] = float(last[col])
+    return row
 
 
 def _load_last_row(csv_path: Path) -> dict[str, float]:
@@ -86,24 +157,12 @@ def _run_and_collect(
 ) -> dict[str, float]:
     metrics_path = out_dir / f"{run_name}.csv"
     _, _, run_training = _get_train_symbols()
-    required_resume_columns = [
-        "episode_env_reward",
-        "avg_env_reward_last_50",
-        "avg_p_time_percent",
-        "avg_c_time_percent",
-        "avg_conflict_percent",
-        "arm_wait3_prob",
-        "arm_backward3_prob",
-        "arm_randomwalk3_prob",
-        "arm_wait2_forward1_prob",
-        "arm_move_clear_prob",
-        "arm_handshake_prob",
-        "arm_reserve_parity_prob",
-        "arm_reserve_parity_escape_prob",
-        "arm_priority_swap_n3_prob",
-        "arm_pass_food_n3_prob",
-        "arm_freeze_tag_prob",
-    ]
+    resume_arm_names = (
+        _parse_bandit_arm_names(bandit_conflict_arms)
+        if baseline_mode == "bandit_ucb1"
+        else None
+    )
+    required_resume_columns = _required_resume_columns(resume_arm_names)
     if resume:
         resumed_last = _load_last_row_if_complete(
             metrics_path,
@@ -210,6 +269,7 @@ def main():
     bandit_reward_model_names, _, _ = _get_train_symbols()
     agent_counts = _parse_int_list(args.agent_counts)
     seeds = _parse_int_list(args.seeds)
+    bandit_arm_names = _parse_bandit_arm_names(args.bandit_conflict_arms)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +377,7 @@ def main():
     main_tasks: list[dict[str, str | int]] = []
     task_idx = 0
     summary_rows: list[dict[str, float | str | int]] = []
+    diagnostics_rows: list[dict[str, float | str | int]] = []
     for n_agents in agent_counts:
         for seed in seeds:
             for method in methods:
@@ -374,6 +435,7 @@ def main():
                 "arm_freeze_tag_prob": float(last["arm_freeze_tag_prob"]),
             }
         )
+        diagnostics_rows.append(_diagnostics_summary_row(task, last, bandit_arm_names))
 
     summary_path = out_dir / "ablation_summary.csv"
     with summary_path.open("w", encoding="utf-8", newline="") as f:
@@ -382,12 +444,43 @@ def main():
         writer.writerows(summary_rows)
     print(f"Saved ablation summary to {summary_path}")
 
+    diagnostics_summary_path = out_dir / "bandit_diagnostics_summary.csv"
+    with diagnostics_summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(diagnostics_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(diagnostics_rows)
+    print(f"Saved bandit diagnostics summary to {diagnostics_summary_path}")
+
     fixed_once_summary_path = out_dir / "fixed_conflict_baselines_once.csv"
     with fixed_once_summary_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(fixed_once_rows[0].keys()))
         writer.writeheader()
         writer.writerows(fixed_once_rows)
     print(f"Saved fixed-conflict one-time summary to {fixed_once_summary_path}")
+
+    plot_script = ROOT / "plot_ablations.py"
+    plot_cmd = [
+        sys.executable,
+        str(plot_script),
+        "--summary_csv",
+        str(summary_path),
+        "--fixed_summary_csv",
+        str(fixed_once_summary_path),
+        "--out_png",
+        str(out_dir / "ablation_scaling.png"),
+        "--bandit_summary_csv",
+        str(diagnostics_summary_path),
+        "--bandit_conflict_arms",
+        args.bandit_conflict_arms,
+        "--out_arm_selection",
+        str(out_dir / "bandit_arm_selection.png"),
+        "--out_diagnostics_grid",
+        str(out_dir / "bandit_arm_diagnostics_grid.png"),
+        "--out_team_util_grid",
+        str(out_dir / "bandit_team_util_grid.png"),
+    ]
+    print(f"Running ablation plots: {' '.join(plot_cmd)}")
+    subprocess.run(plot_cmd, check=True)
 
 
 if __name__ == "__main__":

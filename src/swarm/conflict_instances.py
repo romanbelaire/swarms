@@ -7,6 +7,14 @@ import numpy as np
 MAX_CONFLICT_STEPS_TYPE_NAMES = ("time", "distance")
 
 
+def step_team_utility_mean(infos: dict[str, dict], agent_ids: list[str]) -> float:
+    """Per-step observed team util: mean over agents of (p_t - c_t), in [-1, 1]."""
+    return float(
+        sum(float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"]) for agent_id in agent_ids)
+        / len(agent_ids)
+    )
+
+
 @dataclass(frozen=True)
 class ClosedConflictInstance:
     p_norm: float

@@ -5,7 +5,7 @@ This document translates the requested 3x3 scenario definitions into exact equat
 ## Core Quantities
 
 - Let per-step team utility be:
-  - `Gamma_obs = observed_util = sum_j (P_j - C_j)`
+  - `Gamma_obs = observed_util = mean_j (P_j - C_j)` (agent-mean, in `[-1, 1]` per step)
 - Let agent `i` utility be:
   - `my_util = my_P - my_C`
 - Let:

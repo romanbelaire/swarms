@@ -13,6 +13,7 @@ if __package__ is None:
     if _src_s not in sys.path:
         sys.path.insert(0, _src_s)
 
+from swarm.conflict_instances import step_team_utility_mean
 from swarm.config import OBS_DIM, N_ACTIONS_FULL
 from swarm.dr_panel import render_dr_panel
 from swarm.env import RationalSwarmForagingEnv
@@ -148,9 +149,7 @@ def main():
             obs, _rewards, _term, _trunc, infos = env.step(actions)
             last_env_r = float(infos[env.possible_agents[0]]["env_reward"])
             total_env_reward += last_env_r
-            last_team_util = float(
-                sum(float(infos[aid]["p_t"]) - float(infos[aid]["c_t"]) for aid in env.possible_agents)
-            )
+            last_team_util = step_team_utility_mean(infos, env.possible_agents)
             per_rows = build_rows(obs, last_team_util, infos)
             step_count += 1
 

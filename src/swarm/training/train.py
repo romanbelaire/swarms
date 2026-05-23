@@ -21,6 +21,7 @@ from swarm.conflict_instances import (
     episode_mean_team_util_norm,
     episode_mean_team_util_norm_all_envs,
     new_conflict_trackers,
+    step_team_utility_mean,
 )
 from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit, DRUCBPolicyLearner
 from swarm.config import (
@@ -759,6 +760,63 @@ def _mean_arm_stat(samples: list[float]) -> float:
     return float(np.mean(samples))
 
 
+def _new_training_arm_samples(bandit_arm_names: tuple[str, ...]) -> dict[str, dict[str, list[float]]]:
+    return {
+        arm_name: {"reward": [], "delta": [], "own_p": [], "team_util": []}
+        for arm_name in bandit_arm_names
+    }
+
+
+def _bandit_arm_metric_columns(
+    *,
+    bandit_arm_names: tuple[str, ...],
+    bandits: dict[str, UCB1Bandit],
+    agent_ids: list[str],
+    training_arm_samples: dict[str, dict[str, list[float]]],
+    episode_arm_counts: dict[str, int],
+    arm_counts: dict[str, int],
+) -> dict[str, float]:
+    columns: dict[str, float] = {}
+    ep_sel_total = sum(episode_arm_counts[name] for name in bandit_arm_names)
+    cum_sel_total = sum(arm_counts[name] for name in bandit_arm_names)
+    pull_counts = np.mean(np.stack([bandits[agent_id].counts for agent_id in agent_ids], axis=0), axis=0)
+    for name in CONFLICT_ACTION_NAMES:
+        for suffix in (
+            "pull_count",
+            "ep_sel_frac",
+            "cum_sel_frac",
+            "reward_mean",
+            "reward_var",
+            "delta_mean",
+            "delta_var",
+            "own_p_mean",
+            "team_util_mean",
+            "team_util_var",
+        ):
+            columns[f"arm_{name}_{suffix}"] = np.nan
+    for arm_idx, name in enumerate(bandit_arm_names):
+        columns[f"arm_{name}_pull_count"] = float(pull_counts[arm_idx])
+        columns[f"arm_{name}_ep_sel_frac"] = (
+            float(episode_arm_counts[name] / ep_sel_total) if ep_sel_total > 0 else np.nan
+        )
+        columns[f"arm_{name}_cum_sel_frac"] = (
+            float(arm_counts[name] / cum_sel_total) if cum_sel_total > 0 else np.nan
+        )
+        samples = training_arm_samples[name]
+        rewards = samples["reward"]
+        deltas = samples["delta"]
+        own_ps = samples["own_p"]
+        team_utils = samples["team_util"]
+        columns[f"arm_{name}_reward_mean"] = float(np.mean(rewards)) if len(rewards) > 0 else np.nan
+        columns[f"arm_{name}_reward_var"] = float(np.var(rewards)) if len(rewards) > 0 else np.nan
+        columns[f"arm_{name}_delta_mean"] = float(np.mean(deltas)) if len(deltas) > 0 else np.nan
+        columns[f"arm_{name}_delta_var"] = float(np.var(deltas)) if len(deltas) > 0 else np.nan
+        columns[f"arm_{name}_own_p_mean"] = float(np.mean(own_ps)) if len(own_ps) > 0 else np.nan
+        columns[f"arm_{name}_team_util_mean"] = float(np.mean(team_utils)) if len(team_utils) > 0 else np.nan
+        columns[f"arm_{name}_team_util_var"] = float(np.var(team_utils)) if len(team_utils) > 0 else np.nan
+    return columns
+
+
 def _record_closed_conflict_instance(
     *,
     closed: ClosedConflictInstance,
@@ -834,6 +892,7 @@ def _handle_closed_conflict_instance(
     bandit_arm_names: tuple[str, ...] | None = None,
     bandit_reward_model: str | None = None,
     bandit_credit_mode: str | None = None,
+    training_arm_samples: dict[str, dict[str, list[float]]] | None = None,
 ):
     _record_closed_conflict_instance(
         closed=closed,
@@ -845,6 +904,25 @@ def _handle_closed_conflict_instance(
         agent_id=agent_id,
         arm_name=arm_name,
     )
+    if (
+        training_arm_samples is not None
+        and bandit_reward_model is not None
+        and arm_name is not None
+    ):
+        reward = _bandit_reward_from_episode(
+            bandit_reward_model,
+            team_utility_mean=closed.team_util_norm,
+            own_p_mean=closed.p_norm,
+        )
+        delta = _bandit_dr_delta_raw(
+            bandit_reward_model,
+            team_utility_mean=closed.team_util_norm,
+            own_p_mean=closed.p_norm,
+        )
+        training_arm_samples[arm_name]["reward"].append(reward)
+        training_arm_samples[arm_name]["delta"].append(delta)
+        training_arm_samples[arm_name]["own_p"].append(closed.p_norm)
+        training_arm_samples[arm_name]["team_util"].append(closed.team_util_norm)
     if (
         bandits is not None
         and bandit_arm_names is not None
@@ -985,6 +1063,11 @@ def _run_baseline(args):
             for agent_id in env0.possible_agents
         }
     arm_counts = {name: 0 for name in CONFLICT_ACTION_NAMES}
+    training_arm_samples = (
+        _new_training_arm_samples(bandit_arm_names)
+        if args.baseline_mode == "bandit_ucb1"
+        else None
+    )
 
     episode_metrics = []
     episode_env_rewards = []
@@ -1189,10 +1272,7 @@ def _run_baseline(args):
                 next_obs_list.append(next_obs)
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
-                team_utility = sum(
-                    float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"])
-                    for agent_id in env0.possible_agents
-                )
+                team_utility = step_team_utility_mean(infos, env0.possible_agents)
                 episode_team_utility_samples.append(float(team_utility))
                 new_positions = {a: list(envs[env_idx].agent_positions[a]) for a in env0.possible_agents}
                 for agent_id in env0.possible_agents:
@@ -1228,6 +1308,7 @@ def _run_baseline(args):
                             bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
                             bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
                             bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
+                            training_arm_samples=training_arm_samples,
                         )
                         if args.baseline_mode == "dr_ucb_mixture" and arm_name is not None:
                             meta_loss = _credit_dr_ucb_mixture_instance(
@@ -1285,6 +1366,7 @@ def _run_baseline(args):
                         bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
                         bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
                         bandit_credit_mode=args.bandit_credit_mode if args.baseline_mode == "bandit_ucb1" else None,
+                        training_arm_samples=training_arm_samples,
                     )
                     if args.baseline_mode == "dr_ucb_mixture" and active_conflict_arm[env_idx][agent_id] is not None:
                         meta_loss = _credit_dr_ucb_mixture_instance(
@@ -1371,6 +1453,16 @@ def _run_baseline(args):
             for arm_idx, name in enumerate(bandit_arm_names):
                 metric_row[f"arm_{name}_prob"] = float(probs[arm_idx])
                 metric_row[f"arm_{name}_value"] = float(values[arm_idx])
+            metric_row.update(
+                _bandit_arm_metric_columns(
+                    bandit_arm_names=bandit_arm_names,
+                    bandits=bandits,
+                    agent_ids=env0.possible_agents,
+                    training_arm_samples=training_arm_samples,
+                    episode_arm_counts=episode_arm_counts,
+                    arm_counts=arm_counts,
+                )
+            )
         else:
             metric_row["arm_wait3_prob"] = np.nan
             metric_row["arm_backward3_prob"] = np.nan
@@ -1385,6 +1477,20 @@ def _run_baseline(args):
             metric_row["arm_freeze_tag_prob"] = np.nan
             for name in CONFLICT_ACTION_NAMES:
                 metric_row[f"arm_{name}_value"] = np.nan
+            for name in CONFLICT_ACTION_NAMES:
+                for suffix in (
+                    "pull_count",
+                    "ep_sel_frac",
+                    "cum_sel_frac",
+                    "reward_mean",
+                    "reward_var",
+                    "delta_mean",
+                    "delta_var",
+                    "own_p_mean",
+                    "team_util_mean",
+                    "team_util_var",
+                ):
+                    metric_row[f"arm_{name}_{suffix}"] = np.nan
         episode_metrics.append(metric_row)
 
         if (episode + 1) % 50 == 0:
@@ -1667,7 +1773,7 @@ def run_training(args):
                     )
 
             team_utility_batch = np.array(
-                [sum(float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"]) for agent_id in env0.possible_agents) for infos in infos_list],
+                [step_team_utility_mean(infos, env0.possible_agents) for infos in infos_list],
                 dtype=np.float32,
             )
             for env_idx in range(num_envs):
