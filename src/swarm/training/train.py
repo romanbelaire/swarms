@@ -18,10 +18,10 @@ from swarm.conflict_instances import (
     ConflictInstanceTracker,
     episode_mean_own_p_norm,
     episode_mean_own_p_norm_all_envs,
-    episode_mean_team_util_norm,
-    episode_mean_team_util_norm_all_envs,
+    episode_mean_local_util_norm,
+    episode_mean_local_util_norm_all_envs,
     new_conflict_trackers,
-    step_team_utility_mean,
+    step_local_utility_mean,
 )
 from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit, DRUCBPolicyLearner
 from swarm.config import (
@@ -43,32 +43,22 @@ from swarm.config import (
     RESERVE_PARITY_ACTION,
     RESERVE_PARITY_ESCAPE_ACTION,
     TASK_AVOID_ENABLED_ACTION_IDS,
+    ENABLED_CONFLICT_ARM_NAMES,
+    BANDIT_CONFLICT_ARMS_CSV,
     MAX_CONFLICT_STEPS,
     MAX_CONFLICT_STEPS_TYPE,
     FULL_DURATION_NORM,
 )
 
-CONFLICT_ACTION_NAMES = [
-    "wait3",
-    "backward3",
-    "randomwalk3",
-    "wait2_forward1",
-    "move_clear",
-    "handshake",
-    "reserve_parity",
-    "reserve_parity_escape",
-    "priority_swap_n3",
-    "pass_food_n3",
-    "freeze_tag",
-]
+CONFLICT_ACTION_NAMES = list(ENABLED_CONFLICT_ARM_NAMES)
 ACTION_DELTAS = {0: (-1, 0), 1: (1, 0), 2: (0, -1), 3: (0, 1)}
 PRIORITY_SWAP_TOKEN_STEPS = 3
 CONFLICT_ACTION_ALIASES = {
-    "swap_food_n3": "pass_food_n3",
     "wait_3": "wait3",
-    "backward_3": "backward3",
-    "backwards_2": "backward3",
-    "backwards_3": "backward3",
+    "backward3": "backwards2",
+    "backward_3": "backwards2",
+    "backwards_2": "backwards2",
+    "backwards_3": "backwards2",
 }
 BANDIT_REWARD_MODEL_NAMES = [
     "solver_allc",
@@ -589,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fixed_conflict_action",
         type=str,
-        default="backward3",
+        default="backwards2",
         choices=CONFLICT_ACTION_NAMES,
         help="Fixed conflict macro action used when --baseline_mode fixed_conflict.",
     )
@@ -603,11 +593,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit_conflict_arms",
         type=str,
-        default="",
+        default=BANDIT_CONFLICT_ARMS_CSV,
         help=(
             "bandit_ucb1 only: comma-separated subset of conflict macros "
-            "(default empty = full list CONFLICT_ACTION_NAMES). "
-            'Example: "randomwalk3,freeze_tag,wait3,move_clear,backward3". Aliases: wait_3, backwards_2.'
+            f"(default {BANDIT_CONFLICT_ARMS_CSV!r} from config). "
+            'Empty string uses ENABLED_CONFLICT_ARM_NAMES. Aliases: wait_3, backward3.'
         ),
     )
     parser.add_argument(
@@ -616,6 +606,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="instance_credited",
         choices=BANDIT_CREDIT_MODE_NAMES,
         help="How bandit_ucb1 assigns credit: instance_credited = one softplus(D) update per closed conflict window for the active arm.",
+    )
+    parser.add_argument("--bandit_epsilon_start", type=float, default=1.0, help="Initial epsilon for bandit_ucb1 / dr_ucb_mixture arm selection.")
+    parser.add_argument("--bandit_epsilon_end", type=float, default=0.05, help="Final epsilon after bandit_epsilon_decay pulls.")
+    parser.add_argument(
+        "--bandit_epsilon_decay",
+        type=int,
+        default=10_000,
+        help="Bandit pulls over which epsilon linearly decays from start to end.",
     )
     parser.add_argument("--dr_meta_lr", type=float, default=1e-3, help="Learning rate for dr_ucb_mixture meta-policy MLP.")
     parser.add_argument("--dr_meta_batch_size", type=int, default=32, help="REINFORCE batch size for dr_ucb_mixture meta-policy.")
@@ -642,9 +640,9 @@ def _agent_moved(prev_position: list[int], new_position: list[int]) -> bool:
 def _macro_action_sequence(conflict_action_name: str, expert_action: int, obs: np.ndarray) -> list[int]:
     if conflict_action_name == "wait3":
         return [4, 4, 4]
-    if conflict_action_name == "backward3":
+    if conflict_action_name == "backwards2":
         b = invert_move(int(expert_action))
-        return [b, b, b]
+        return [b, b]
     if conflict_action_name == "randomwalk3":
         return random_walk_actions(3)
     if conflict_action_name == "wait2_forward1":
@@ -681,7 +679,7 @@ def _canonical_conflict_action_name(action_name: str) -> str:
 
 def baseline_bandit_arms_tuple(bandit_conflict_arms_csv: str) -> tuple[str, ...]:
     if bandit_conflict_arms_csv.strip() == "":
-        return tuple(CONFLICT_ACTION_NAMES)
+        return tuple(ENABLED_CONFLICT_ARM_NAMES)
     parsed: list[str] = []
     for raw in bandit_conflict_arms_csv.split(","):
         token = raw.strip()
@@ -709,7 +707,7 @@ def _dr_softplus(x: float) -> float:
 def _bandit_dr_delta_raw(
     model_name: str,
     *,
-    team_utility_mean: float,
+    local_utility_mean: float,
     own_p_mean: float,
 ) -> float:
     fd = float(FULL_DURATION_NORM)
@@ -718,32 +716,32 @@ def _bandit_dr_delta_raw(
     if model_name == "solver_allp":
         return fd
     if model_name == "solver_allsame":
-        return float(team_utility_mean)
+        return float(local_utility_mean)
     if model_name == "neutral_allc":
         return float(-own_p_mean)
     if model_name == "neutral_allp":
         return float(fd - own_p_mean)
     if model_name == "neutral_allsame":
-        return float(team_utility_mean - own_p_mean)
+        return float(local_utility_mean - own_p_mean)
     if model_name == "causer_allc":
         return float(-fd)
     if model_name == "causer_allp":
         return 0.0
     if model_name == "causer_allsame":
-        return float(team_utility_mean - fd)
+        return float(local_utility_mean - fd)
     raise ValueError(f"Unknown bandit_reward_model: {model_name}")
 
 
 def _bandit_reward_from_episode(
     model_name: str,
     *,
-    team_utility_mean: float,
+    local_utility_mean: float,
     own_p_mean: float,
 ) -> float:
     return _dr_softplus(
         _bandit_dr_delta_raw(
             model_name,
-            team_utility_mean=team_utility_mean,
+            local_utility_mean=local_utility_mean,
             own_p_mean=own_p_mean,
         )
     )
@@ -751,18 +749,33 @@ def _bandit_reward_from_episode(
 
 def _new_episode_arm_stats(agent_ids: list[str], arm_names: tuple[str, ...]) -> dict[str, dict[str, dict[str, list[float]]]]:
     return {
-        agent_id: {arm_name: {"own_p": [], "team_util": []} for arm_name in arm_names}
+        agent_id: {arm_name: {"own_p": [], "local_util": []} for arm_name in arm_names}
         for agent_id in agent_ids
     }
 
 
-def _mean_arm_stat(samples: list[float]) -> float:
+def _mean_or_nan(samples: list[float]) -> float:
+    if len(samples) == 0:
+        return float(np.nan)
     return float(np.mean(samples))
+
+
+def _mean_arm_stat(samples: list[float]) -> float:
+    return _mean_or_nan(samples)
+
+
+def _new_ucb_bandit(n_arms: int, args) -> UCB1Bandit:
+    return UCB1Bandit(
+        n_arms,
+        epsilon_start=args.bandit_epsilon_start,
+        epsilon_end=args.bandit_epsilon_end,
+        epsilon_decay_steps=args.bandit_epsilon_decay,
+    )
 
 
 def _new_training_arm_samples(bandit_arm_names: tuple[str, ...]) -> dict[str, dict[str, list[float]]]:
     return {
-        arm_name: {"reward": [], "delta": [], "own_p": [], "team_util": []}
+        arm_name: {"reward": [], "delta": [], "own_p": [], "local_util": []}
         for arm_name in bandit_arm_names
     }
 
@@ -790,8 +803,8 @@ def _bandit_arm_metric_columns(
             "delta_mean",
             "delta_var",
             "own_p_mean",
-            "team_util_mean",
-            "team_util_var",
+            "local_util_mean",
+            "local_util_var",
         ):
             columns[f"arm_{name}_{suffix}"] = np.nan
     for arm_idx, name in enumerate(bandit_arm_names):
@@ -806,14 +819,14 @@ def _bandit_arm_metric_columns(
         rewards = samples["reward"]
         deltas = samples["delta"]
         own_ps = samples["own_p"]
-        team_utils = samples["team_util"]
+        local_utils = samples["local_util"]
         columns[f"arm_{name}_reward_mean"] = float(np.mean(rewards)) if len(rewards) > 0 else np.nan
         columns[f"arm_{name}_reward_var"] = float(np.var(rewards)) if len(rewards) > 0 else np.nan
         columns[f"arm_{name}_delta_mean"] = float(np.mean(deltas)) if len(deltas) > 0 else np.nan
         columns[f"arm_{name}_delta_var"] = float(np.var(deltas)) if len(deltas) > 0 else np.nan
         columns[f"arm_{name}_own_p_mean"] = float(np.mean(own_ps)) if len(own_ps) > 0 else np.nan
-        columns[f"arm_{name}_team_util_mean"] = float(np.mean(team_utils)) if len(team_utils) > 0 else np.nan
-        columns[f"arm_{name}_team_util_var"] = float(np.var(team_utils)) if len(team_utils) > 0 else np.nan
+        columns[f"arm_{name}_local_util_mean"] = float(np.mean(local_utils)) if len(local_utils) > 0 else np.nan
+        columns[f"arm_{name}_local_util_var"] = float(np.var(local_utils)) if len(local_utils) > 0 else np.nan
     return columns
 
 
@@ -822,7 +835,7 @@ def _record_closed_conflict_instance(
     closed: ClosedConflictInstance,
     episode_own_p_samples: list[float],
     episode_own_c_samples: list[float],
-    episode_team_utility_samples: list[float],
+    episode_local_utility_samples: list[float],
     episode_own_p_by_agent: dict[str, list[float]],
     episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]] | None,
     agent_id: str,
@@ -830,11 +843,11 @@ def _record_closed_conflict_instance(
 ):
     episode_own_p_samples.append(closed.p_norm)
     episode_own_c_samples.append(closed.c_norm)
-    episode_team_utility_samples.append(closed.team_util_norm)
+    episode_local_utility_samples.append(closed.local_util_norm)
     episode_own_p_by_agent[agent_id].append(closed.p_norm)
     if episode_arm_stats is not None and arm_name is not None:
         episode_arm_stats[agent_id][arm_name]["own_p"].append(closed.p_norm)
-        episode_arm_stats[agent_id][arm_name]["team_util"].append(closed.team_util_norm)
+        episode_arm_stats[agent_id][arm_name]["local_util"].append(closed.local_util_norm)
 
 
 def _credit_bandit_conflict_instance(
@@ -849,7 +862,7 @@ def _credit_bandit_conflict_instance(
     arm_idx = bandit_arm_names.index(arm_name)
     reward = _bandit_reward_from_episode(
         bandit_reward_model,
-        team_utility_mean=closed.team_util_norm,
+        local_utility_mean=closed.local_util_norm,
         own_p_mean=closed.p_norm,
     )
     bandits[agent_id].update(arm_idx, reward)
@@ -870,7 +883,7 @@ def _credit_dr_ucb_mixture_instance(
     arm_idx = bandit_arm_names.index(arm_name)
     reward = _bandit_reward_from_episode(
         dr_name,
-        team_utility_mean=closed.team_util_norm,
+        local_utility_mean=closed.local_util_norm,
         own_p_mean=closed.p_norm,
     )
     nested_bandits[agent_id][dr_name].update(arm_idx, reward)
@@ -883,7 +896,7 @@ def _handle_closed_conflict_instance(
     closed: ClosedConflictInstance,
     episode_own_p_samples: list[float],
     episode_own_c_samples: list[float],
-    episode_team_utility_samples: list[float],
+    episode_local_utility_samples: list[float],
     episode_own_p_by_agent: dict[str, list[float]],
     episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]] | None,
     agent_id: str,
@@ -898,7 +911,7 @@ def _handle_closed_conflict_instance(
         closed=closed,
         episode_own_p_samples=episode_own_p_samples,
         episode_own_c_samples=episode_own_c_samples,
-        episode_team_utility_samples=episode_team_utility_samples,
+        episode_local_utility_samples=episode_local_utility_samples,
         episode_own_p_by_agent=episode_own_p_by_agent,
         episode_arm_stats=episode_arm_stats,
         agent_id=agent_id,
@@ -911,18 +924,18 @@ def _handle_closed_conflict_instance(
     ):
         reward = _bandit_reward_from_episode(
             bandit_reward_model,
-            team_utility_mean=closed.team_util_norm,
+            local_utility_mean=closed.local_util_norm,
             own_p_mean=closed.p_norm,
         )
         delta = _bandit_dr_delta_raw(
             bandit_reward_model,
-            team_utility_mean=closed.team_util_norm,
+            local_utility_mean=closed.local_util_norm,
             own_p_mean=closed.p_norm,
         )
         training_arm_samples[arm_name]["reward"].append(reward)
         training_arm_samples[arm_name]["delta"].append(delta)
         training_arm_samples[arm_name]["own_p"].append(closed.p_norm)
-        training_arm_samples[arm_name]["team_util"].append(closed.team_util_norm)
+        training_arm_samples[arm_name]["local_util"].append(closed.local_util_norm)
     if (
         bandits is not None
         and bandit_arm_names is not None
@@ -950,12 +963,12 @@ def _apply_bandit_episode_updates(
     conflict_trackers_by_env: list[dict[str, ConflictInstanceTracker]],
     agent_ids: list[str],
 ):
-    team_utility_mean_episode = episode_mean_team_util_norm_all_envs(conflict_trackers_by_env, agent_ids)
+    local_utility_mean_episode = episode_mean_local_util_norm_all_envs(conflict_trackers_by_env, agent_ids)
     if bandit_credit_mode == "episode_shared":
         own_p_mean_episode = episode_mean_own_p_norm_all_envs(conflict_trackers_by_env, agent_ids)
         reward_for_update = _bandit_reward_from_episode(
             bandit_reward_model,
-            team_utility_mean=team_utility_mean_episode,
+            local_utility_mean=local_utility_mean_episode,
             own_p_mean=own_p_mean_episode,
         )
         for agent_id in agent_ids:
@@ -974,16 +987,16 @@ def _apply_bandit_episode_updates(
                 continue
             own_p_k = _mean_arm_stat(arm_samples["own_p"])
             if bandit_credit_mode == "per_arm_credited":
-                team_k = _mean_arm_stat(arm_samples["team_util"])
+                local_k = _mean_arm_stat(arm_samples["local_util"])
                 reward_k = _bandit_reward_from_episode(
                     bandit_reward_model,
-                    team_utility_mean=team_k,
+                    local_utility_mean=local_k,
                     own_p_mean=own_p_k,
                 )
             elif bandit_credit_mode == "arm_relative_my_role":
                 delta = _bandit_dr_delta_raw(
                     bandit_reward_model,
-                    team_utility_mean=team_utility_mean_episode,
+                    local_utility_mean=local_utility_mean_episode,
                     own_p_mean=own_p_episode,
                 )
                 if bandit_reward_model.startswith("neutral_"):
@@ -1040,7 +1053,7 @@ def _run_baseline(args):
     if args.baseline_mode == "bandit_ucb1":
         bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
         bandits = {
-            agent_id: UCB1Bandit(n_arms=len(bandit_arm_names)) for agent_id in env0.possible_agents
+            agent_id: _new_ucb_bandit(len(bandit_arm_names), args) for agent_id in env0.possible_agents
         }
     elif args.baseline_mode == "dr_ucb_mixture":
         if args.bandit_credit_mode != "instance_credited":
@@ -1048,7 +1061,7 @@ def _run_baseline(args):
         bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
         bandits = {
             agent_id: {
-                dr_name: UCB1Bandit(n_arms=len(bandit_arm_names))
+                dr_name: _new_ucb_bandit(len(bandit_arm_names), args)
                 for dr_name in BANDIT_REWARD_MODEL_NAMES
             }
             for agent_id in env0.possible_agents
@@ -1085,7 +1098,7 @@ def _run_baseline(args):
         episode_own_p_samples = []
         episode_own_c_samples = []
         episode_conflict_samples = []
-        episode_team_utility_samples = []
+        episode_local_utility_samples = []
         episode_own_p_by_agent = {agent_id: [] for agent_id in env0.possible_agents}
         episode_arm_stats = _new_episode_arm_stats(env0.possible_agents, bandit_arm_names)
         conflict_trackers = [
@@ -1272,8 +1285,6 @@ def _run_baseline(args):
                 next_obs_list.append(next_obs)
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
-                team_utility = step_team_utility_mean(infos, env0.possible_agents)
-                episode_team_utility_samples.append(float(team_utility))
                 new_positions = {a: list(envs[env_idx].agent_positions[a]) for a in env0.possible_agents}
                 for agent_id in env0.possible_agents:
                     is_c = float(selected_is_c[env_idx][agent_id])
@@ -1285,10 +1296,11 @@ def _run_baseline(args):
                         episode_conflict_samples.append(has_conflict)
                         prev_conflict_flags[env_idx][agent_id] = bool(has_conflict)
                     tracker = conflict_trackers[env_idx][agent_id]
+                    local_util = step_local_utility_mean(infos, agent_id, new_positions)
                     closed = tracker.step(
                         p_t=float(infos[agent_id]["p_t"]),
                         c_t=float(infos[agent_id]["c_t"]),
-                        team_util=float(team_utility),
+                        local_util=float(local_util),
                         n_local=float(infos[agent_id]["n_local"]),
                         new_conflict_event=float(infos[agent_id]["new_conflict_event"]),
                         agent_moved=_agent_moved(prev_positions_list[env_idx][agent_id], new_positions[agent_id]),
@@ -1299,7 +1311,7 @@ def _run_baseline(args):
                             closed=closed,
                             episode_own_p_samples=episode_own_p_samples,
                             episode_own_c_samples=episode_own_c_samples,
-                            episode_team_utility_samples=episode_team_utility_samples,
+                            episode_local_utility_samples=episode_local_utility_samples,
                             episode_own_p_by_agent=episode_own_p_by_agent,
                             episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                             agent_id=agent_id,
@@ -1329,7 +1341,7 @@ def _run_baseline(args):
                             arm_idx = bandit_arm_names.index(arm_name)
                             reward_step = _bandit_reward_from_episode(
                                 args.bandit_reward_model,
-                                team_utility_mean=tracker.running_team_util_norm(),
+                                local_utility_mean=tracker.running_local_util_norm(),
                                 own_p_mean=tracker.running_p_norm(),
                             )
                             bandits[agent_id].update(arm_idx, reward_step)
@@ -1357,7 +1369,7 @@ def _run_baseline(args):
                         closed=closed,
                         episode_own_p_samples=episode_own_p_samples,
                         episode_own_c_samples=episode_own_c_samples,
-                        episode_team_utility_samples=episode_team_utility_samples,
+                        episode_local_utility_samples=episode_local_utility_samples,
                         episode_own_p_by_agent=episode_own_p_by_agent,
                         episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                         agent_id=agent_id,
@@ -1413,17 +1425,17 @@ def _run_baseline(args):
             "avg_env_reward_last_50": float(np.mean(episode_env_rewards[-50:])),
             "episode_env_reward": float(episode_env_reward),
             "episode_env_reward_raw": float(episode_env_reward_raw),
-            "avg_p_time_fraction": float(np.mean(episode_own_p_samples)),
-            "avg_p_time_percent": float(100.0 * np.mean(episode_own_p_samples)),
-            "avg_c_time_fraction": float(np.mean(episode_own_c_samples)),
-            "avg_c_time_percent": float(100.0 * np.mean(episode_own_c_samples)),
-            "avg_conflict_fraction": float(np.mean(episode_conflict_samples)),
-            "avg_conflict_percent": float(100.0 * np.mean(episode_conflict_samples)),
+            "avg_p_time_fraction": _mean_or_nan(episode_own_p_samples),
+            "avg_p_time_percent": float(100.0 * _mean_or_nan(episode_own_p_samples)),
+            "avg_c_time_fraction": _mean_or_nan(episode_own_c_samples),
+            "avg_c_time_percent": float(100.0 * _mean_or_nan(episode_own_c_samples)),
+            "avg_conflict_fraction": _mean_or_nan(episode_conflict_samples),
+            "avg_conflict_percent": float(100.0 * _mean_or_nan(episode_conflict_samples)),
             "epsilon": float(eps),
             "policy_loss_mean": np.nan,
             "critic_loss_mean": np.nan,
             "dr_loss_mean": np.nan,
-            "dr_meta_loss_mean": float(np.mean(episode_dr_meta_losses)) if len(episode_dr_meta_losses) > 0 else np.nan,
+            "dr_meta_loss_mean": _mean_or_nan(episode_dr_meta_losses),
             "dr_mixed_reward_mean": np.nan,
             "u_solver_mean": np.nan,
             "u_neutral_mean": np.nan,
@@ -1432,17 +1444,7 @@ def _run_baseline(args):
             "v_p_mean": np.nan,
             "v_mean_mean": np.nan,
             "my_mean_mean": np.nan,
-            "arm_wait3_count": float(arm_counts["wait3"]),
-            "arm_backward3_count": float(arm_counts["backward3"]),
-            "arm_randomwalk3_count": float(arm_counts["randomwalk3"]),
-            "arm_wait2_forward1_count": float(arm_counts["wait2_forward1"]),
-            "arm_move_clear_count": float(arm_counts["move_clear"]),
-            "arm_handshake_count": float(arm_counts["handshake"]),
-            "arm_reserve_parity_count": float(arm_counts["reserve_parity"]),
-            "arm_reserve_parity_escape_count": float(arm_counts["reserve_parity_escape"]),
-            "arm_priority_swap_n3_count": float(arm_counts["priority_swap_n3"]),
-            "arm_pass_food_n3_count": float(arm_counts["pass_food_n3"]),
-            "arm_freeze_tag_count": float(arm_counts["freeze_tag"]),
+            **{f"arm_{name}_count": float(arm_counts[name]) for name in CONFLICT_ACTION_NAMES},
         }
         if args.baseline_mode == "bandit_ucb1":
             probs = np.mean(np.stack([bandits[a].arm_probabilities() for a in env0.possible_agents], axis=0), axis=0)
@@ -1464,17 +1466,8 @@ def _run_baseline(args):
                 )
             )
         else:
-            metric_row["arm_wait3_prob"] = np.nan
-            metric_row["arm_backward3_prob"] = np.nan
-            metric_row["arm_randomwalk3_prob"] = np.nan
-            metric_row["arm_wait2_forward1_prob"] = np.nan
-            metric_row["arm_move_clear_prob"] = np.nan
-            metric_row["arm_handshake_prob"] = np.nan
-            metric_row["arm_reserve_parity_prob"] = np.nan
-            metric_row["arm_reserve_parity_escape_prob"] = np.nan
-            metric_row["arm_priority_swap_n3_prob"] = np.nan
-            metric_row["arm_pass_food_n3_prob"] = np.nan
-            metric_row["arm_freeze_tag_prob"] = np.nan
+            for name in CONFLICT_ACTION_NAMES:
+                metric_row[f"arm_{name}_prob"] = np.nan
             for name in CONFLICT_ACTION_NAMES:
                 metric_row[f"arm_{name}_value"] = np.nan
             for name in CONFLICT_ACTION_NAMES:
@@ -1487,8 +1480,8 @@ def _run_baseline(args):
                     "delta_mean",
                     "delta_var",
                     "own_p_mean",
-                    "team_util_mean",
-                    "team_util_var",
+                    "local_util_mean",
+                    "local_util_var",
                 ):
                     metric_row[f"arm_{name}_{suffix}"] = np.nan
         episode_metrics.append(metric_row)
@@ -1613,11 +1606,11 @@ def run_training(args):
             obs_i, _ = envs[env_idx].reset(seed=episode * num_envs + env_idx)
             obs_list.append(obs_i)
 
-        episode_train_inputs = {agent_id: {"obs": [], "team_utility": [], "own_p": [], "own_c": []} for agent_id in env0.possible_agents}
+        episode_train_inputs = {agent_id: {"obs": [], "local_utility": [], "own_p": [], "own_c": []} for agent_id in env0.possible_agents}
         episode_own_p_samples = []
         episode_own_c_samples = []
         episode_conflict_samples = []
-        episode_team_utility_samples = []
+        episode_local_utility_samples = []
         conflict_trackers = [
             new_conflict_trackers(env0.possible_agents, args.max_conflict_steps, args.max_conflict_steps_type)
             for _ in range(num_envs)
@@ -1772,18 +1765,15 @@ def run_training(args):
                         env_actions[env_idx],
                     )
 
-            team_utility_batch = np.array(
-                [step_team_utility_mean(infos, env0.possible_agents) for infos in infos_list],
-                dtype=np.float32,
-            )
             for env_idx in range(num_envs):
-                team_util = float(team_utility_batch[env_idx])
+                positions = new_positions_list[env_idx]
                 for agent_id in env0.possible_agents:
                     agent_info = infos_list[env_idx][agent_id]
+                    local_util = step_local_utility_mean(infos_list[env_idx], agent_id, positions)
                     closed = conflict_trackers[env_idx][agent_id].step(
                         p_t=float(agent_info["p_t"]),
                         c_t=float(agent_info["c_t"]),
-                        team_util=team_util,
+                        local_util=float(local_util),
                         n_local=float(agent_info["n_local"]),
                         new_conflict_event=float(agent_info["new_conflict_event"]),
                         agent_moved=_agent_moved(
@@ -1796,7 +1786,7 @@ def run_training(args):
                             closed=closed,
                             episode_own_p_samples=episode_own_p_samples,
                             episode_own_c_samples=episode_own_c_samples,
-                            episode_team_utility_samples=episode_team_utility_samples,
+                            episode_local_utility_samples=episode_local_utility_samples,
                             episode_own_p_by_agent=episode_own_p_by_agent,
                             episode_arm_stats=None,
                             agent_id=agent_id,
@@ -1827,9 +1817,9 @@ def run_training(args):
                     ],
                     dtype=np.float32,
                 )
-                team_utility_norm_batch = np.array(
+                local_utility_norm_batch = np.array(
                     [
-                        conflict_trackers[e][agent_id].running_team_util_norm()
+                        conflict_trackers[e][agent_id].running_local_util_norm()
                         if conflict_trackers[e][agent_id].active
                         else 0.0
                         for e in range(num_envs)
@@ -1845,13 +1835,13 @@ def run_training(args):
                 else:
                     reward_batch, _dr_eval = dr_learners[agent_id].reward_batch(
                         obs_batch=obs_batch,
-                        team_utility_batch=team_utility_norm_batch,
+                        local_utility_batch=local_utility_norm_batch,
                         own_p_batch=own_p_batch,
                         own_c_batch=own_c_batch,
                     )
                     active_envs = [env_idx for env_idx in range(num_envs) if conflict_trackers[env_idx][agent_id].active]
                     episode_train_inputs[agent_id]["obs"].extend(obs_batch[active_envs])
-                    episode_train_inputs[agent_id]["team_utility"].extend(team_utility_norm_batch[active_envs].tolist())
+                    episode_train_inputs[agent_id]["local_utility"].extend(local_utility_norm_batch[active_envs].tolist())
                     episode_train_inputs[agent_id]["own_p"].extend(own_p_batch[active_envs].tolist())
                     episode_train_inputs[agent_id]["own_c"].extend(own_c_batch[active_envs].tolist())
 
@@ -1876,7 +1866,7 @@ def run_training(args):
                         closed=closed,
                         episode_own_p_samples=episode_own_p_samples,
                         episode_own_c_samples=episode_own_c_samples,
-                        episode_team_utility_samples=episode_team_utility_samples,
+                        episode_local_utility_samples=episode_local_utility_samples,
                         episode_own_p_by_agent=episode_own_p_by_agent,
                         episode_arm_stats=None,
                         agent_id=agent_id,
@@ -1910,7 +1900,7 @@ def run_training(args):
                     raise ValueError("Scenario mixture training inputs are unexpectedly empty")
                 dr_stats = dr_learners[agent_id].train_step_batch(
                     obs_batch=np.array(episode_train_inputs[agent_id]["obs"], dtype=np.float32),
-                    team_utility_batch=np.array(episode_train_inputs[agent_id]["team_utility"], dtype=np.float32),
+                    local_utility_batch=np.array(episode_train_inputs[agent_id]["local_utility"], dtype=np.float32),
                     own_p_batch=np.array(episode_train_inputs[agent_id]["own_p"], dtype=np.float32),
                     own_c_batch=np.array(episode_train_inputs[agent_id]["own_c"], dtype=np.float32),
                 )
@@ -1935,14 +1925,14 @@ def run_training(args):
             "avg_env_reward_last_50": float(np.mean(episode_env_rewards[-50:])),
             "episode_env_reward": float(episode_env_reward),
             "episode_env_reward_raw": float(episode_env_reward_raw),
-            "avg_p_time_fraction": float(np.mean(episode_own_p_samples)),
-            "avg_p_time_percent": float(100.0 * np.mean(episode_own_p_samples)),
-            "avg_c_time_fraction": float(np.mean(episode_own_c_samples)),
-            "avg_c_time_percent": float(100.0 * np.mean(episode_own_c_samples)),
-            "avg_conflict_fraction": float(np.mean(episode_conflict_samples)),
-            "avg_conflict_percent": float(100.0 * np.mean(episode_conflict_samples)),
+            "avg_p_time_fraction": _mean_or_nan(episode_own_p_samples),
+            "avg_p_time_percent": float(100.0 * _mean_or_nan(episode_own_p_samples)),
+            "avg_c_time_fraction": _mean_or_nan(episode_own_c_samples),
+            "avg_c_time_percent": float(100.0 * _mean_or_nan(episode_own_c_samples)),
+            "avg_conflict_fraction": _mean_or_nan(episode_conflict_samples),
+            "avg_conflict_percent": float(100.0 * _mean_or_nan(episode_conflict_samples)),
             "epsilon": float(eps),
-            "policy_loss_mean": float(np.mean(policy_losses)) if len(policy_losses) > 0 else np.nan,
+            "policy_loss_mean": _mean_or_nan(policy_losses),
             "critic_loss_mean": float(np.mean(critic_losses)) if len(critic_losses) > 0 else np.nan,
             "dr_loss_mean": float(np.mean(dr_losses)) if len(dr_losses) > 0 else np.nan,
             "dr_mixed_reward_mean": float(np.mean(dr_mixed_reward_vals)) if len(dr_mixed_reward_vals) > 0 else np.nan,
@@ -1953,28 +1943,8 @@ def run_training(args):
             "v_p_mean": float(np.mean(dr_v_p_vals)) if len(dr_v_p_vals) > 0 else np.nan,
             "v_mean_mean": float(np.mean(dr_v_mean_vals)) if len(dr_v_mean_vals) > 0 else np.nan,
             "my_mean_mean": float(np.mean(dr_my_mean_vals)) if len(dr_my_mean_vals) > 0 else np.nan,
-            "arm_wait3_count": np.nan,
-            "arm_backward3_count": np.nan,
-            "arm_randomwalk3_count": np.nan,
-            "arm_wait2_forward1_count": np.nan,
-            "arm_move_clear_count": np.nan,
-            "arm_handshake_count": np.nan,
-            "arm_reserve_parity_count": np.nan,
-            "arm_reserve_parity_escape_count": np.nan,
-            "arm_priority_swap_n3_count": np.nan,
-            "arm_pass_food_n3_count": np.nan,
-            "arm_freeze_tag_count": np.nan,
-            "arm_wait3_prob": np.nan,
-            "arm_backward3_prob": np.nan,
-            "arm_randomwalk3_prob": np.nan,
-            "arm_wait2_forward1_prob": np.nan,
-            "arm_move_clear_prob": np.nan,
-            "arm_handshake_prob": np.nan,
-            "arm_reserve_parity_prob": np.nan,
-            "arm_reserve_parity_escape_prob": np.nan,
-            "arm_priority_swap_n3_prob": np.nan,
-            "arm_pass_food_n3_prob": np.nan,
-            "arm_freeze_tag_prob": np.nan,
+            **{f"arm_{name}_count": np.nan for name in CONFLICT_ACTION_NAMES},
+            **{f"arm_{name}_prob": np.nan for name in CONFLICT_ACTION_NAMES},
         }
         episode_metrics.append(metric_row)
         if (episode + 1) % 50 == 0:

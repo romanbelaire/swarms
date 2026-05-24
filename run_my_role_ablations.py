@@ -24,12 +24,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from run_ablations import _load_last_row, _load_last_row_if_complete, _parse_int_list
+from swarm.config import BANDIT_CONFLICT_ARMS_CSV, ENABLED_CONFLICT_ARM_NAMES
 
 _TRAIN_SYMBOLS = None
 
 CREDIT_TRIALS = ("per_arm_credited", "arm_relative_my_role", "step_level")
 OTHERS_SUFFIXES = ("allsame", "allp", "allc")
-BANDIT_ARMS = ("randomwalk3", "freeze_tag", "wait3", "move_clear", "backward3")
+BANDIT_ARMS = ENABLED_CONFLICT_ARM_NAMES
 DEFAULT_OUT_ROOT = "artifacts/my_role_credit_ablations"
 DEFAULT_FIXED_SUMMARY_CSV = "artifacts/ablations/fixed_conflict_baselines_once.csv"
 
@@ -187,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit_conflict_arms",
         type=str,
-        default=",".join(BANDIT_ARMS),
+        default=BANDIT_CONFLICT_ARMS_CSV,
     )
     parser.add_argument(
         "--run_fixed",
@@ -307,7 +308,7 @@ def main():
                             "local_grid_size": 5,
                             "expert_checkpoint": args.expert_checkpoint,
                             "baseline_mode": "bandit_ucb1",
-                            "fixed_conflict_action": "backward3",
+                            "fixed_conflict_action": "backwards2",
                             "bandit_reward_model": reward_model,
                             "bandit_conflict_arms": args.bandit_conflict_arms,
                             "bandit_credit_mode": credit_mode,

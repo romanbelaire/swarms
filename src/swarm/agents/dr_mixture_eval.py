@@ -39,7 +39,7 @@ class DRMixtureEvaluator:
     def evaluate(
         self,
         obs: np.ndarray,
-        team_utility: float,
+        local_utility: float,
         own_p: float,
     ) -> dict[str, np.ndarray | float]:
         """
@@ -48,7 +48,7 @@ class DRMixtureEvaluator:
         """
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            team_utility_t = torch.tensor([float(team_utility)], dtype=torch.float32, device=DEVICE)
+            local_utility_t = torch.tensor([float(local_utility)], dtype=torch.float32, device=DEVICE)
             own_p_t = torch.tensor([float(own_p)], dtype=torch.float32, device=DEVICE)
 
             self_logits, others_logits = self.net(obs_t)
@@ -56,8 +56,8 @@ class DRMixtureEvaluator:
             v = torch.softmax(others_logits, dim=1)
             w = u.unsqueeze(2) * v.unsqueeze(1)
 
-            full_duration_t = torch.full_like(team_utility_t, self.full_duration)
-            zero_t = torch.zeros_like(team_utility_t)
+            full_duration_t = torch.full_like(local_utility_t, self.full_duration)
+            zero_t = torch.zeros_like(local_utility_t)
 
             without_me = torch.stack(
                 (
@@ -69,9 +69,9 @@ class DRMixtureEvaluator:
             )
             with_me = torch.stack(
                 (
-                    torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
-                    torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
-                    torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
+                    torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
+                    torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
+                    torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
                 ),
                 dim=1,
             )

@@ -79,9 +79,9 @@ Default outputs are written to `artifacts/`:
 - `--critic_lr`, `--critic_gamma`: critic optimizer settings
 - `--dr_entropy_coef`: entropy regularization for DR gates
 - `--baseline_mode`: `none`, `bandit_ucb1`, `random_conflict`, `fixed_conflict`
-- `--fixed_conflict_action`: `wait3`, `backward3`, `randomwalk3`, `wait2_forward1`, `move_clear`, `handshake`
+- `--fixed_conflict_action`: one of `ENABLED_CONFLICT_ARM_NAMES` in `src/swarm/config.py` (`freeze_tag`, `randomwalk3`, `wait3`, `move_clear`, `backwards2`)
 - Task-avoid high-level actions are enabled via `TASK_AVOID_ENABLED_ACTION_IDS` in `src/swarm/config.py`; set an action constant to `-1` to disable it.
-- `handshake` semantics: target is the agent in your forward heading (last successful move direction). Both must choose `handshake` and mutually target each other to succeed; success performs swap then one additional forward move via macro queue, failure waits now +2 queued waits and also turns to face a random adjacent agent (if any).
+- Bandit / ablation conflict arms default to `BANDIT_CONFLICT_ARMS_CSV` in `src/swarm/config.py` (same five macros).
 
 ## Ablation Baselines
 

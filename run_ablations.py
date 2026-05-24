@@ -17,6 +17,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from swarm.config import BANDIT_CONFLICT_ARMS_CSV, ENABLED_CONFLICT_ARM_NAMES
+
 _TRAIN_SYMBOLS: tuple[list[str], object, object] | None = None
 
 
@@ -55,8 +57,8 @@ BANDIT_DIAGNOSTIC_SUFFIXES = (
     "delta_mean",
     "delta_var",
     "own_p_mean",
-    "team_util_mean",
-    "team_util_var",
+    "local_util_mean",
+    "local_util_var",
 )
 
 
@@ -73,20 +75,7 @@ def _required_resume_columns(arm_names: list[str] | None) -> list[str]:
         "avg_conflict_percent",
     ]
     if arm_names is None:
-        return [
-            *base,
-            "arm_wait3_prob",
-            "arm_backward3_prob",
-            "arm_randomwalk3_prob",
-            "arm_wait2_forward1_prob",
-            "arm_move_clear_prob",
-            "arm_handshake_prob",
-            "arm_reserve_parity_prob",
-            "arm_reserve_parity_escape_prob",
-            "arm_priority_swap_n3_prob",
-            "arm_pass_food_n3_prob",
-            "arm_freeze_tag_prob",
-        ]
+        return [*base, *[f"arm_{name}_prob" for name in ENABLED_CONFLICT_ARM_NAMES]]
     return [*base, *_bandit_diagnostic_column_names(arm_names)]
 
 
@@ -236,8 +225,8 @@ def _execute_tasks(tasks: list[dict], num_workers: int) -> list[tuple[int, dict[
 
 def build_ablation_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent_counts", type=str, default="3,5,8", help="Comma-separated agent counts")
-    parser.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated integer seeds")
+    parser.add_argument("--agent_counts", type=str, default="5,10,20,40,60", help="Comma-separated agent counts")
+    parser.add_argument("--seeds", type=str, default="0", help="Comma-separated integer seeds")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--max_steps_per_episode", type=int, default=200)
     parser.add_argument("--num_envs", type=int, default=1)
@@ -253,10 +242,10 @@ def build_ablation_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit_conflict_arms",
         type=str,
-        default="randomwalk3,freeze_tag,wait3,move_clear,backward3",
+        default=BANDIT_CONFLICT_ARMS_CSV,
         help=(
-            "bandit_ucb1 sweep only: comma-separated arms (canonical names); empty string uses full CONFLICT_ACTION_NAMES. "
-            "Aliases understood via train.CONFLICT_ACTION_ALIASES (e.g. wait_3, backwards_2)."
+            "bandit_ucb1 sweep only: comma-separated arms (canonical names); empty string uses "
+            "ENABLED_CONFLICT_ARM_NAMES from config. Aliases via train.CONFLICT_ACTION_ALIASES."
         ),
     )
     return parser
@@ -286,19 +275,7 @@ def main():
     if args.num_workers <= 0:
         raise ValueError("--num_workers must be positive")
 
-    fixed_conflict_actions = [
-        "wait3",
-        "backward3",
-        "randomwalk3",
-        "wait2_forward1",
-        "move_clear",
-        "handshake",
-        "reserve_parity",
-        "reserve_parity_escape",
-        "priority_swap_n3",
-        "pass_food_n3",
-        "freeze_tag",
-    ]
+    fixed_conflict_actions = list(ENABLED_CONFLICT_ARM_NAMES)
     fixed_tasks: list[dict[str, str | int]] = []
     fixed_once_rows: list[dict[str, float | str | int]] = []
     fixed_once_seed = seeds[0]
@@ -347,7 +324,7 @@ def main():
                 "local_grid_size": args.local_grid_size,
                 "expert_checkpoint": args.expert_checkpoint,
                 "baseline_mode": "collision_free",
-                "fixed_conflict_action": "backward3",
+                "fixed_conflict_action": "backwards2",
                 "bandit_reward_model": "neutral_allsame",
                 "bandit_conflict_arms": "",
                 "resume": args.resume,
@@ -398,7 +375,7 @@ def main():
                         "local_grid_size": args.local_grid_size,
                         "expert_checkpoint": args.expert_checkpoint,
                         "baseline_mode": method["baseline_mode"],
-                        "fixed_conflict_action": "backward3",
+                        "fixed_conflict_action": "backwards2",
                         "bandit_reward_model": method["bandit_reward_model"],
                         "bandit_conflict_arms": args.bandit_conflict_arms,
                         "method": method["name"],
@@ -422,17 +399,7 @@ def main():
                 "avg_p_time_percent": float(last["avg_p_time_percent"]),
                 "avg_c_time_percent": float(last["avg_c_time_percent"]),
                 "avg_conflict_percent": float(last["avg_conflict_percent"]),
-                "arm_wait3_prob": float(last["arm_wait3_prob"]),
-                "arm_backward3_prob": float(last["arm_backward3_prob"]),
-                "arm_randomwalk3_prob": float(last["arm_randomwalk3_prob"]),
-                "arm_wait2_forward1_prob": float(last["arm_wait2_forward1_prob"]),
-                "arm_move_clear_prob": float(last["arm_move_clear_prob"]),
-                "arm_handshake_prob": float(last["arm_handshake_prob"]),
-                "arm_reserve_parity_prob": float(last["arm_reserve_parity_prob"]),
-                "arm_reserve_parity_escape_prob": float(last["arm_reserve_parity_escape_prob"]),
-                "arm_priority_swap_n3_prob": float(last["arm_priority_swap_n3_prob"]),
-                "arm_pass_food_n3_prob": float(last["arm_pass_food_n3_prob"]),
-                "arm_freeze_tag_prob": float(last["arm_freeze_tag_prob"]),
+                **{f"arm_{name}_prob": float(last[f"arm_{name}_prob"]) for name in ENABLED_CONFLICT_ARM_NAMES},
             }
         )
         diagnostics_rows.append(_diagnostics_summary_row(task, last, bandit_arm_names))
@@ -474,10 +441,10 @@ def main():
         args.bandit_conflict_arms,
         "--out_arm_selection",
         str(out_dir / "bandit_arm_selection.png"),
-        "--out_diagnostics_grid",
-        str(out_dir / "bandit_arm_diagnostics_grid.png"),
-        "--out_team_util_grid",
-        str(out_dir / "bandit_team_util_grid.png"),
+        "--out_bandit_metrics_dir",
+        str(out_dir),
+        "--out_local_util_grid",
+        str(out_dir / "bandit_local_util_grid.png"),
     ]
     print(f"Running ablation plots: {' '.join(plot_cmd)}")
     subprocess.run(plot_cmd, check=True)

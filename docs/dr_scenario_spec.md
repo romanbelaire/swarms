@@ -4,8 +4,9 @@ This document translates the requested 3x3 scenario definitions into exact equat
 
 ## Core Quantities
 
-- Let per-step team utility be:
-  - `Gamma_obs = observed_util = mean_j (P_j - C_j)` (agent-mean, in `[-1, 1]` per step)
+- Let per-step local utility for agent `i` be:
+  - `Gamma_obs = observed_util = mean_{j in N(i)} (P_j - C_j)` where `N(i)` is `i` plus
+    orthogonal neighbors (in `[-1, 1]` per step)
 - Let agent `i` utility be:
   - `my_util = my_P - my_C`
 - Let:
@@ -58,7 +59,7 @@ The two axes are separable:
 
 ## Math-to-Code Mapping Targets
 
-- `Gamma_obs` / `observed_util` -> current `team_utility` batch/scalar passed to DR learner
+- `Gamma_obs` / `observed_util` -> current `local_utility` batch/scalar passed to DR learner
 - `my_P` -> per closed conflict instance, `sum(p_t) / (sum(p_t) + sum(c_t))` over the
   full episode of that conflict: avoidance steps while `n_local > 1`, then program
   steps (including immune haul) until `n_local > 1` again; averaged over closed instances.
@@ -67,7 +68,7 @@ The two axes are separable:
 - `my_C` -> `1 - my_P` for the same instance (i.e. `sum(c_t) / (sum(p_t) + sum(c_t))`)
 - `full_duration` -> `FULL_DURATION_NORM` (1.0) in `config.py`
 - UCB bandit DR updates use `softplus(D)` so rewards are positive and stationary
-- Default bandit credit (`instance_credited`): one UCB update per **closed conflict instance** for the active macro arm, using that instance's normalized `p`, `c`, and team util (not episode-shared)
+- Default bandit credit (`instance_credited`): one UCB update per **closed conflict instance** for the active macro arm, using that instance's normalized `p`, `c`, and local util (not episode-shared)
 - `my_mean` -> running mean of observed `P^i` samples (used in stats/logging only; no longer appears in scenario table)
 - `D(role, others)` -> per-scenario reward tensor `scenario_delta = with_me - without_me`
 

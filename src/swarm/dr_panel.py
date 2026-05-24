@@ -57,7 +57,6 @@ def render_dr_panel(
     panel_rect: pygame.Rect,
     per_agent_rows: list[dict],
     env_reward: float,
-    team_utility: float,
     step_idx: int,
     my_mean_by_agent: dict[str, float],
 ):
@@ -72,7 +71,7 @@ def render_dr_panel(
     header_h = 28
     hr = pygame.Rect(panel_rect.x + 4, panel_rect.y + 4, panel_rect.w - 8, header_h)
     pygame.draw.rect(canvas, (210, 215, 225), hr)
-    t = f"step {step_idx}  env_R={env_reward:.2f}  team_util={team_utility:.2f}"
+    t = f"step {step_idx}  env_R={env_reward:.2f}"
     canvas.blit(font.render(t, True, (0, 0, 0)), (hr.x + 4, hr.y + 6))
 
     n_agents = len(per_agent_rows)

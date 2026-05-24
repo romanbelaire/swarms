@@ -7,11 +7,23 @@ import numpy as np
 MAX_CONFLICT_STEPS_TYPE_NAMES = ("time", "distance")
 
 
-def step_team_utility_mean(infos: dict[str, dict], agent_ids: list[str]) -> float:
-    """Per-step observed team util: mean over agents of (p_t - c_t), in [-1, 1]."""
+def step_local_utility_mean(
+    infos: dict[str, dict],
+    agent_id: str,
+    positions: dict[str, list[int]],
+) -> float:
+    """Per-step local util: mean over self and orthogonal neighbors of (p_t - c_t), in [-1, 1]."""
+    ax, ay = positions[agent_id]
+    local_ids = [agent_id]
+    for other_id, other_pos in positions.items():
+        if other_id == agent_id:
+            continue
+        ox, oy = other_pos
+        if (ox == ax - 1 and oy == ay) or (ox == ax + 1 and oy == ay) or (ox == ax and oy == ay - 1) or (ox == ax and oy == ay + 1):
+            local_ids.append(other_id)
     return float(
-        sum(float(infos[agent_id]["p_t"]) - float(infos[agent_id]["c_t"]) for agent_id in agent_ids)
-        / len(agent_ids)
+        sum(float(infos[aid]["p_t"]) - float(infos[aid]["c_t"]) for aid in local_ids)
+        / len(local_ids)
     )
 
 
@@ -19,7 +31,7 @@ def step_team_utility_mean(infos: dict[str, dict], agent_ids: list[str]) -> floa
 class ClosedConflictInstance:
     p_norm: float
     c_norm: float
-    team_util_norm: float
+    local_util_norm: float
     length: int
 
 
@@ -53,7 +65,7 @@ class ConflictInstanceTracker:
         self._phase = ""
         self._p = 0
         self._c = 0
-        self._team_util = 0.0
+        self._local_util = 0.0
         self._unmoved_steps = 0
         self._closed: list[ClosedConflictInstance] = []
 
@@ -62,7 +74,7 @@ class ConflictInstanceTracker:
         *,
         p_t: float,
         c_t: float,
-        team_util: float,
+        local_util: float,
         n_local: float,
         new_conflict_event: float,
         agent_moved: bool,
@@ -78,37 +90,37 @@ class ConflictInstanceTracker:
 
         if in_conflict:
             if self._active and self._phase == "avoidance" and self._should_split_avoidance(agent_moved):
-                closed = self._split_avoidance(p_t, c_t, team_util, agent_moved)
+                closed = self._split_avoidance(p_t, c_t, local_util, agent_moved)
             elif not self._active:
-                self._open_avoidance(p_t, c_t, team_util, agent_moved)
+                self._open_avoidance(p_t, c_t, local_util, agent_moved)
             elif self._phase == "avoidance":
-                self._accumulate(p_t, c_t, team_util, agent_moved)
+                self._accumulate(p_t, c_t, local_util, agent_moved)
             else:
-                self._open_avoidance(p_t, c_t, team_util, agent_moved)
+                self._open_avoidance(p_t, c_t, local_util, agent_moved)
         elif self._active:
             if self._phase == "avoidance":
                 self._phase = "program_haul"
                 self._unmoved_steps = 0
-                self._accumulate(p_t, c_t, team_util, agent_moved)
+                self._accumulate(p_t, c_t, local_util, agent_moved)
             else:
-                self._accumulate(p_t, c_t, team_util, agent_moved)
+                self._accumulate(p_t, c_t, local_util, agent_moved)
 
         return closed
 
-    def _open_avoidance(self, p_t: float, c_t: float, team_util: float, agent_moved: bool):
+    def _open_avoidance(self, p_t: float, c_t: float, local_util: float, agent_moved: bool):
         self._active = True
         self._phase = "avoidance"
         self._unmoved_steps = 0
         self._p = int(p_t)
         self._c = int(c_t)
-        self._team_util = float(team_util)
+        self._local_util = float(local_util)
         if self._max_conflict_steps > 0 and self._max_conflict_steps_type == "distance" and not agent_moved:
             self._unmoved_steps = 1
 
-    def _accumulate(self, p_t: float, c_t: float, team_util: float, agent_moved: bool):
+    def _accumulate(self, p_t: float, c_t: float, local_util: float, agent_moved: bool):
         self._p += int(p_t)
         self._c += int(c_t)
-        self._team_util += float(team_util)
+        self._local_util += float(local_util)
         if self._phase == "avoidance" and self._max_conflict_steps > 0 and self._max_conflict_steps_type == "distance":
             if agent_moved:
                 self._unmoved_steps = 0
@@ -123,9 +135,9 @@ class ConflictInstanceTracker:
         next_unmoved = 0 if agent_moved else self._unmoved_steps + 1
         return next_unmoved >= self._max_conflict_steps
 
-    def _split_avoidance(self, p_t: float, c_t: float, team_util: float, agent_moved: bool) -> ClosedConflictInstance:
+    def _split_avoidance(self, p_t: float, c_t: float, local_util: float, agent_moved: bool) -> ClosedConflictInstance:
         closed = self._close()
-        self._open_avoidance(p_t, c_t, team_util, agent_moved)
+        self._open_avoidance(p_t, c_t, local_util, agent_moved)
         return closed
 
     def finalize_episode(self) -> ClosedConflictInstance | None:
@@ -140,7 +152,7 @@ class ConflictInstanceTracker:
         inst = ClosedConflictInstance(
             p_norm=float(self._p) / float(length),
             c_norm=float(self._c) / float(length),
-            team_util_norm=float(self._team_util) / float(length),
+            local_util_norm=float(self._local_util) / float(length),
             length=length,
         )
         self._closed.append(inst)
@@ -148,7 +160,7 @@ class ConflictInstanceTracker:
         self._phase = ""
         self._p = 0
         self._c = 0
-        self._team_util = 0.0
+        self._local_util = 0.0
         self._unmoved_steps = 0
         return inst
 
@@ -164,11 +176,11 @@ class ConflictInstanceTracker:
             return 0.0
         return float(self._c) / float(length)
 
-    def running_team_util_norm(self) -> float:
+    def running_local_util_norm(self) -> float:
         length = self._p + self._c
         if length <= 0:
             return 0.0
-        return float(self._team_util) / float(length)
+        return float(self._local_util) / float(length)
 
     @property
     def active(self) -> bool:
@@ -184,10 +196,10 @@ class ConflictInstanceTracker:
             return 0.0
         return float(sum(inst.c_norm for inst in self._closed) / len(self._closed))
 
-    def mean_closed_team_util_norm(self) -> float:
+    def mean_closed_local_util_norm(self) -> float:
         if len(self._closed) == 0:
             return 0.0
-        return float(sum(inst.team_util_norm for inst in self._closed) / len(self._closed))
+        return float(sum(inst.local_util_norm for inst in self._closed) / len(self._closed))
 
 
 def new_conflict_trackers(
@@ -205,8 +217,8 @@ def episode_mean_own_p_norm(trackers: dict[str, ConflictInstanceTracker], agent_
     return float(sum(trackers[agent_id].mean_closed_p_norm() for agent_id in agent_ids) / len(agent_ids))
 
 
-def episode_mean_team_util_norm(trackers: dict[str, ConflictInstanceTracker], agent_ids: list[str]) -> float:
-    values = [trackers[agent_id].mean_closed_team_util_norm() for agent_id in agent_ids]
+def episode_mean_local_util_norm(trackers: dict[str, ConflictInstanceTracker], agent_ids: list[str]) -> float:
+    values = [trackers[agent_id].mean_closed_local_util_norm() for agent_id in agent_ids]
     return float(sum(values) / len(values))
 
 
@@ -217,8 +229,8 @@ def episode_mean_own_p_norm_all_envs(
     return float(np.mean([episode_mean_own_p_norm(trackers, agent_ids) for trackers in trackers_by_env]))
 
 
-def episode_mean_team_util_norm_all_envs(
+def episode_mean_local_util_norm_all_envs(
     trackers_by_env: list[dict[str, ConflictInstanceTracker]],
     agent_ids: list[str],
 ) -> float:
-    return float(np.mean([episode_mean_team_util_norm(trackers, agent_ids) for trackers in trackers_by_env]))
+    return float(np.mean([episode_mean_local_util_norm(trackers, agent_ids) for trackers in trackers_by_env]))

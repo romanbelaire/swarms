@@ -133,16 +133,16 @@ class DRScenarioMixtureLearner:
         if self.running_own_p_count <= 0:
             raise ValueError("running_own_p_count must stay positive after update")
 
-    def _forward_tensors(self, obs_t: torch.Tensor, team_utility_t: torch.Tensor, own_p_t: torch.Tensor, own_c_t: torch.Tensor):
+    def _forward_tensors(self, obs_t: torch.Tensor, local_utility_t: torch.Tensor, own_p_t: torch.Tensor, own_c_t: torch.Tensor):
         self_logits, others_logits = self.net(obs_t)
         u = torch.softmax(self_logits, dim=1)
         v = torch.softmax(others_logits, dim=1)
         w = u.unsqueeze(2) * v.unsqueeze(1)
         own_utility = own_p_t - own_c_t
         my_mean_value = self.running_own_p_sum / self.running_own_p_count
-        my_mean_t = torch.full_like(team_utility_t, float(my_mean_value))
-        full_duration_t = torch.full_like(team_utility_t, float(self.full_duration))
-        zero_t = torch.zeros_like(team_utility_t)
+        my_mean_t = torch.full_like(local_utility_t, float(my_mean_value))
+        full_duration_t = torch.full_like(local_utility_t, float(self.full_duration))
+        zero_t = torch.zeros_like(local_utility_t)
 
         # U_without: pure function of my-role axis (constant across others columns)
         # solver=0, neutral=my_P, causer=full_duration
@@ -158,9 +158,9 @@ class DRScenarioMixtureLearner:
         # AllC=0, AllP=full_duration, AllSame=obs_util
         with_me = torch.stack(
             (
-                torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
-                torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
-                torch.stack((zero_t, full_duration_t, team_utility_t), dim=1),
+                torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
+                torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
+                torch.stack((zero_t, full_duration_t, local_utility_t), dim=1),
             ),
             dim=1,
         )
@@ -169,23 +169,23 @@ class DRScenarioMixtureLearner:
         self._require_finite(mixed_reward, "mixed_reward")
         return {"u": u, "v": v, "mixed_reward": mixed_reward, "own_utility": own_utility, "my_mean": my_mean_t}
 
-    def reward_batch(self, obs_batch: np.ndarray, team_utility_batch: np.ndarray, own_p_batch: np.ndarray, own_c_batch: np.ndarray):
+    def reward_batch(self, obs_batch: np.ndarray, local_utility_batch: np.ndarray, own_p_batch: np.ndarray, own_c_batch: np.ndarray):
         with torch.no_grad():
             obs_t = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
-            team_utility_t = torch.tensor(team_utility_batch, dtype=torch.float32, device=self.device)
+            local_utility_t = torch.tensor(local_utility_batch, dtype=torch.float32, device=self.device)
             own_p_t = torch.tensor(own_p_batch, dtype=torch.float32, device=self.device)
             own_c_t = torch.tensor(own_c_batch, dtype=torch.float32, device=self.device)
             self._update_running_my_mean(own_p_t)
-            out = self._forward_tensors(obs_t, team_utility_t, own_p_t, own_c_t)
+            out = self._forward_tensors(obs_t, local_utility_t, own_p_t, own_c_t)
             stats = {"u": out["u"].cpu().numpy(), "v": out["v"].cpu().numpy(), "mixed_reward": out["mixed_reward"].cpu().numpy()}
             return out["mixed_reward"].cpu().numpy(), stats
 
-    def train_step_batch(self, obs_batch: np.ndarray, team_utility_batch: np.ndarray, own_p_batch: np.ndarray, own_c_batch: np.ndarray):
+    def train_step_batch(self, obs_batch: np.ndarray, local_utility_batch: np.ndarray, own_p_batch: np.ndarray, own_c_batch: np.ndarray):
         obs_t = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
-        team_utility_t = torch.tensor(team_utility_batch, dtype=torch.float32, device=self.device)
+        local_utility_t = torch.tensor(local_utility_batch, dtype=torch.float32, device=self.device)
         own_p_t = torch.tensor(own_p_batch, dtype=torch.float32, device=self.device)
         own_c_t = torch.tensor(own_c_batch, dtype=torch.float32, device=self.device)
-        out = self._forward_tensors(obs_t, team_utility_t, own_p_t, own_c_t)
+        out = self._forward_tensors(obs_t, local_utility_t, own_p_t, own_c_t)
         reward_loss = nn.functional.mse_loss(out["mixed_reward"], out["own_utility"])
         entropy_u = -(out["u"] * torch.log(out["u"] + 1e-12)).sum(dim=1).mean()
         entropy_v = -(out["v"] * torch.log(out["v"] + 1e-12)).sum(dim=1).mean()
@@ -325,34 +325,70 @@ class FrozenTaskExpert:
 
 class UCB1Bandit:
     """
-    Non-contextual UCB1 bandit over conflict-action macro arms.
+    Non-contextual epsilon-greedy bandit over conflict-action macro arms.
+    Per-arm rewards are z-scored with a running mean/variance before value updates.
     """
 
-    def __init__(self, n_arms: int):
+    def __init__(
+        self,
+        n_arms: int,
+        epsilon_start: float = 1.0,
+        epsilon_end: float = 0.05,
+        epsilon_decay_steps: int = 10_000,
+    ):
         if n_arms <= 0:
             raise ValueError("n_arms must be positive")
         self.n_arms = n_arms
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay_steps = epsilon_decay_steps
         self.counts = np.zeros(n_arms, dtype=np.int64)
         self.values = np.zeros(n_arms, dtype=np.float64)
+        self.reward_means = np.zeros(n_arms, dtype=np.float64)
+        self.reward_m2 = np.zeros(n_arms, dtype=np.float64)
         self.total_pulls = 0
 
+    def epsilon(self) -> float:
+        if self.total_pulls >= self.epsilon_decay_steps:
+            return self.epsilon_end
+        frac = self.total_pulls / self.epsilon_decay_steps
+        return self.epsilon_start + frac * (self.epsilon_end - self.epsilon_start)
+
+    def _standardized_reward(self, arm: int, reward: float) -> float:
+        n_prior = int(self.counts[arm])
+        if n_prior < 1:
+            return 0.0
+        var = self.reward_m2[arm] / float(n_prior)
+        std = float(np.sqrt(var))
+        if std == 0.0:
+            return 0.0
+        return (float(reward) - self.reward_means[arm]) / std
+
+    def _record_raw_reward(self, arm: int, reward: float):
+        n = int(self.counts[arm]) + 1
+        delta = float(reward) - self.reward_means[arm]
+        self.reward_means[arm] += delta / float(n)
+        delta2 = float(reward) - self.reward_means[arm]
+        self.reward_m2[arm] += delta * delta2
+
     def select_arm(self) -> int:
-        # Pull each arm once before UCB scoring.
         for arm in range(self.n_arms):
             if self.counts[arm] == 0:
                 return arm
-        exploration = np.sqrt(2.0 * np.log(float(self.total_pulls)) / self.counts.astype(np.float64))
-        scores = self.values + exploration
-        return int(np.argmax(scores))
+        if random.random() < self.epsilon():
+            return random.randint(0, self.n_arms - 1)
+        return int(np.argmax(self.values))
 
     def update(self, arm: int, reward: float):
         if arm < 0 or arm >= self.n_arms:
             raise ValueError(f"arm index out of range: {arm}")
+        standardized = self._standardized_reward(arm, reward)
+        self._record_raw_reward(arm, reward)
         self.total_pulls += 1
         self.counts[arm] += 1
         n = float(self.counts[arm])
         old = self.values[arm]
-        self.values[arm] = old + (float(reward) - old) / n
+        self.values[arm] = old + (standardized - old) / n
 
     def arm_probabilities(self) -> np.ndarray:
         if self.total_pulls == 0:

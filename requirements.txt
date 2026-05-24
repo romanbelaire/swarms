@@ -1,5 +1,5 @@
 numpy
-pygame
+pygame-ce
 pettingzoo
 gymnasium
 # PyPI installs CPU-only wheels (version shows +cpu). torchvision does not add CUDA.

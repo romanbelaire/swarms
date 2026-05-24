@@ -13,7 +13,7 @@ if __package__ is None:
     if _src_s not in sys.path:
         sys.path.insert(0, _src_s)
 
-from swarm.conflict_instances import step_team_utility_mean
+from swarm.conflict_instances import step_local_utility_mean
 from swarm.config import OBS_DIM, N_ACTIONS_FULL
 from swarm.dr_panel import render_dr_panel
 from swarm.env import RationalSwarmForagingEnv
@@ -115,14 +115,14 @@ def main():
         running = True
         step_count = 0
         total_env_reward = 0.0
-        last_team_util = 0.0
         last_env_r = 0.0
 
-        def build_rows(o_dict, team_util: float, infos_dict: dict):
+        def build_rows(o_dict, infos_dict: dict, positions: dict[str, list[int]]):
             rows = []
             for aid in env.possible_agents:
                 own_p = float(infos_dict[aid]["p_t"])
-                out = dr_evaluators[aid].evaluate(o_dict[aid], team_util, own_p)
+                local_util = step_local_utility_mean(infos_dict, aid, positions)
+                out = dr_evaluators[aid].evaluate(o_dict[aid], local_util, own_p)
                 rows.append(
                     {
                         "agent_id": aid,
@@ -149,8 +149,8 @@ def main():
             obs, _rewards, _term, _trunc, infos = env.step(actions)
             last_env_r = float(infos[env.possible_agents[0]]["env_reward"])
             total_env_reward += last_env_r
-            last_team_util = step_team_utility_mean(infos, env.possible_agents)
-            per_rows = build_rows(obs, last_team_util, infos)
+            positions = {a: list(env.agent_positions[a]) for a in env.possible_agents}
+            per_rows = build_rows(obs, infos, positions)
             step_count += 1
 
             rgb = env.render()
@@ -160,7 +160,7 @@ def main():
             screen.fill((40, 40, 45))
             screen.blit(env_surf, (0, 0))
             panel_rect = pygame.Rect(grid_px, 0, panel_w, win_h)
-            render_dr_panel(screen, panel_rect, per_rows, last_env_r, last_team_util, step_count, my_mean_by_agent)
+            render_dr_panel(screen, panel_rect, per_rows, last_env_r, step_count, my_mean_by_agent)
             pygame.display.flip()
 
             if args.step_delay > 0:

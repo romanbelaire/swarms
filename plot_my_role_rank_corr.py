@@ -10,6 +10,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+import sys
+
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from swarm.config import BANDIT_CONFLICT_ARMS_CSV
+
 MY_ROLES = ("solver", "neutral", "causer")
 OTHERS_ROLES = ("allc", "allp", "allsame")
 MY_ROLE_PAIRS = (
@@ -265,7 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arms",
         type=str,
-        default="randomwalk3,freeze_tag,wait3,move_clear,backward3",
+        default=BANDIT_CONFLICT_ARMS_CSV,
     )
     return parser
 

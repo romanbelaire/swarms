@@ -9,18 +9,21 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+import sys
+
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from swarm.config import BANDIT_CONFLICT_ARMS_CSV
+
 ARM_COLORS = {
     "randomwalk3": "#1f77b4",
     "freeze_tag": "#ff7f0e",
     "wait3": "#2ca02c",
     "move_clear": "#d62728",
-    "backward3": "#9467bd",
-    "wait2_forward1": "#8c564b",
-    "handshake": "#e377c2",
-    "reserve_parity": "#7f7f7f",
-    "reserve_parity_escape": "#bcbd22",
-    "priority_swap_n3": "#17becf",
-    "pass_food_n3": "#aec7e8",
+    "backwards2": "#9467bd",
 }
 
 
@@ -191,132 +194,35 @@ def _plot_arm_selection(
     print(f"Saved arm selection plot: {out_png}")
 
 
-def _plot_diagnostics_grid(
+def _arm_metric_mean_std(
+    rows: list[dict[str, str]],
+    *,
+    method: str,
+    n_agents: int,
+    arm: str,
+    column_suffix: str,
+) -> tuple[float, float]:
+    if column_suffix == "delta_mean":
+        return _aggregate_delta(rows, method=method, n_agents=n_agents, arm=arm)
+    return _aggregate_metric(
+        rows,
+        method=method,
+        n_agents=n_agents,
+        column=f"arm_{arm}_{column_suffix}",
+    )
+
+
+def _plot_per_arm_metric_grid(
     rows: list[dict[str, str]],
     *,
     methods: list[str],
     arms: tuple[str, ...],
     agent_counts: list[int],
+    column_suffix: str,
+    ylabel: str,
+    suptitle: str,
     out_png: Path,
-) -> None:
-    n_arms = len(arms)
-    n_ns = len(agent_counts)
-    n_metrics = 4
-    metric_specs = (
-        ("delta_mean", "D"),
-        ("value", "Q (norm)"),
-        ("pull_count", "pulls (norm)"),
-        ("own_p_mean", "own_p"),
-    )
-
-    fig, axes = plt.subplots(3, 3, figsize=(18, 14), constrained_layout=True)
-    x_centers = np.arange(n_ns, dtype=np.float64)
-
-    for idx, method in enumerate(methods):
-        ax = axes.ravel()[idx]
-        group_width = 0.75
-        cluster_width = group_width / n_arms
-        pull_values: list[float] = []
-        for n_agents in agent_counts:
-            for arm in arms:
-                mean_pull, _ = _aggregate_metric(
-                    rows, method=method, n_agents=n_agents, column=f"arm_{arm}_pull_count"
-                )
-                pull_values.append(mean_pull)
-        pull_max = float(np.max(pull_values))
-        if pull_max <= 0.0:
-            pull_max = 1.0
-        q_values: list[float] = []
-        for n_agents in agent_counts:
-            for arm in arms:
-                mean_q, _ = _aggregate_metric(
-                    rows, method=method, n_agents=n_agents, column=f"arm_{arm}_value"
-                )
-                q_values.append(mean_q)
-        q_max = float(np.max(q_values))
-        if q_max <= 0.0:
-            q_max = 1.0
-
-        for arm_idx, arm in enumerate(arms):
-            cluster_offset = -group_width / 2.0 + cluster_width / 2.0 + arm_idx * cluster_width
-            metric_offsets = np.linspace(-cluster_width * 0.4, cluster_width * 0.4, n_metrics)
-            arm_color = ARM_COLORS.get(arm, None)
-            for n_idx, n_agents in enumerate(agent_counts):
-                base_x = x_centers[n_idx]
-                for metric_idx, (mean_col, _label) in enumerate(metric_specs):
-                    bar_x = base_x + cluster_offset + metric_offsets[metric_idx]
-                    if mean_col == "delta_mean":
-                        mean_val, std_val = _aggregate_delta(
-                            rows, method=method, n_agents=n_agents, arm=arm
-                        )
-                        height = mean_val
-                        yerr = std_val
-                    elif mean_col == "pull_count":
-                        mean_val, _ = _aggregate_metric(
-                            rows, method=method, n_agents=n_agents, column=f"arm_{arm}_{mean_col}"
-                        )
-                        height = mean_val / pull_max
-                        yerr = 0.0
-                    elif mean_col == "value":
-                        mean_val, _ = _aggregate_metric(
-                            rows, method=method, n_agents=n_agents, column=f"arm_{arm}_{mean_col}"
-                        )
-                        height = mean_val / q_max
-                        yerr = 0.0
-                    else:
-                        mean_val, std_val = _aggregate_metric(
-                            rows, method=method, n_agents=n_agents, column=f"arm_{arm}_{mean_col}"
-                        )
-                        height = mean_val
-                        yerr = std_val
-                    hatch = "" if metric_idx < 3 else "///"
-                    ax.bar(
-                        bar_x,
-                        height,
-                        width=cluster_width / (n_metrics + 1.0),
-                        color=arm_color,
-                        alpha=0.55 if metric_idx >= 3 else 0.85,
-                        hatch=hatch,
-                        yerr=yerr,
-                        capsize=2,
-                        error_kw={"elinewidth": 0.8},
-                        label=arm if idx == 0 and n_idx == 0 and metric_idx == 0 else None,
-                    )
-
-        ax.set_title(method, fontsize=9)
-        ax.set_xticks(x_centers)
-        ax.set_xticklabels([str(n) for n in agent_counts], fontsize=8)
-        ax.set_xlabel("Number of Agents")
-        ax.set_ylabel("metric value")
-        ax.grid(axis="y", alpha=0.25)
-
-    legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=ARM_COLORS.get(arm, "gray"), label=arm)
-        for arm in arms
-    ]
-    legend_handles.extend(
-        [
-            plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.85, label="D / Q / pulls"),
-            plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.55, hatch="///", label="own_p"),
-        ]
-    )
-    fig.legend(handles=legend_handles, loc="upper center", ncol=min(n_arms + 2, 8), bbox_to_anchor=(0.5, 1.02))
-    fig.suptitle(
-        "Per-arm bandit diagnostics by DR (x = N; D = logged delta; Q & pulls scaled per subplot)",
-        fontsize=12,
-        y=1.04,
-    )
-    fig.savefig(out_png, dpi=150, bbox_inches="tight")
-    print(f"Saved diagnostics grid plot: {out_png}")
-
-
-def _plot_team_util_grid(
-    rows: list[dict[str, str]],
-    *,
-    methods: list[str],
-    arms: tuple[str, ...],
-    agent_counts: list[int],
-    out_png: Path,
+    y_reference: float | None = None,
 ) -> None:
     n_arms = len(arms)
     n_ns = len(agent_counts)
@@ -335,8 +241,12 @@ def _plot_team_util_grid(
             yerrs: list[float] = []
             bar_xs: list[float] = []
             for n_idx, n_agents in enumerate(agent_counts):
-                mean_val, std_val = _aggregate_metric(
-                    rows, method=method, n_agents=n_agents, column=f"arm_{arm}_team_util_mean"
+                mean_val, std_val = _arm_metric_mean_std(
+                    rows,
+                    method=method,
+                    n_agents=n_agents,
+                    arm=arm,
+                    column_suffix=column_suffix,
                 )
                 bar_xs.append(x_centers[n_idx] + offset)
                 heights.append(mean_val)
@@ -356,19 +266,92 @@ def _plot_team_util_grid(
         ax.set_xticks(x_centers)
         ax.set_xticklabels([str(n) for n in agent_counts], fontsize=8)
         ax.set_xlabel("Number of Agents")
-        ax.set_ylabel("agent-mean team util")
-        ax.axhline(0.0, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax.set_ylabel(ylabel)
+        if y_reference is not None:
+            ax.axhline(y_reference, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
         ax.grid(axis="y", alpha=0.25)
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=n_arms, bbox_to_anchor=(0.5, 1.02), fontsize=8)
-    fig.suptitle(
-        "Per-arm agent-mean team util by DR (length-normalized observed_util input)",
-        fontsize=12,
-        y=1.04,
-    )
+    fig.suptitle(suptitle, fontsize=12, y=1.04)
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
-    print(f"Saved team util plot: {out_png}")
+    print(f"Saved bandit metric plot: {out_png}")
+
+
+BANDIT_METRIC_GRID_SPECS = (
+    (
+        "delta_mean",
+        "mean DR delta D",
+        "Per-arm mean DR delta D by scenario (instance-level, pre-softplus)",
+        "bandit_arm_delta_grid.png",
+        0.0,
+    ),
+    (
+        "value",
+        "UCB Q estimate",
+        "Per-arm UCB Q estimate by DR scenario at convergence",
+        "bandit_arm_q_grid.png",
+        None,
+    ),
+    (
+        "pull_count",
+        "mean pull count",
+        "Per-arm UCB pull count by DR scenario at convergence",
+        "bandit_arm_pulls_grid.png",
+        None,
+    ),
+    (
+        "own_p_mean",
+        "own P share",
+        "Per-arm own P share by DR scenario (length-normalized instance)",
+        "bandit_arm_own_p_grid.png",
+        None,
+    ),
+)
+
+
+def _plot_bandit_metric_grids(
+    rows: list[dict[str, str]],
+    *,
+    methods: list[str],
+    arms: tuple[str, ...],
+    agent_counts: list[int],
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for column_suffix, ylabel, suptitle, filename, y_reference in BANDIT_METRIC_GRID_SPECS:
+        _plot_per_arm_metric_grid(
+            rows,
+            methods=methods,
+            arms=arms,
+            agent_counts=agent_counts,
+            column_suffix=column_suffix,
+            ylabel=ylabel,
+            suptitle=suptitle,
+            out_png=out_dir / filename,
+            y_reference=y_reference,
+        )
+
+
+def _plot_local_util_grid(
+    rows: list[dict[str, str]],
+    *,
+    methods: list[str],
+    arms: tuple[str, ...],
+    agent_counts: list[int],
+    out_png: Path,
+) -> None:
+    _plot_per_arm_metric_grid(
+        rows,
+        methods=methods,
+        arms=arms,
+        agent_counts=agent_counts,
+        column_suffix="local_util_mean",
+        ylabel="agent-mean local util",
+        suptitle="Per-arm agent-mean local util by DR (length-normalized observed_util input)",
+        out_png=out_png,
+        y_reference=0.0,
+    )
 
 
 def _plot_bandit_diagnostics(args: argparse.Namespace) -> None:
@@ -385,19 +368,19 @@ def _plot_bandit_diagnostics(args: argparse.Namespace) -> None:
         n_agents_filter=args.n_agents,
         out_png=Path(args.out_arm_selection),
     )
-    _plot_diagnostics_grid(
+    _plot_bandit_metric_grids(
         rows,
         methods=methods,
         arms=arms,
         agent_counts=agent_counts,
-        out_png=Path(args.out_diagnostics_grid),
+        out_dir=Path(args.out_bandit_metrics_dir),
     )
-    _plot_team_util_grid(
+    _plot_local_util_grid(
         rows,
         methods=methods,
         arms=arms,
         agent_counts=agent_counts,
-        out_png=Path(args.out_team_util_grid),
+        out_png=Path(args.out_local_util_grid),
     )
 
 
@@ -416,8 +399,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="artifacts/ablations/bandit_diagnostics_summary.csv",
     )
     parser.add_argument("--out_arm_selection", type=str, default="artifacts/ablations/bandit_arm_selection.png")
-    parser.add_argument("--out_diagnostics_grid", type=str, default="artifacts/ablations/bandit_arm_diagnostics_grid.png")
-    parser.add_argument("--out_team_util_grid", type=str, default="artifacts/ablations/bandit_team_util_grid.png")
+    parser.add_argument(
+        "--out_bandit_metrics_dir",
+        type=str,
+        default="artifacts/ablations",
+        help="Directory for per-metric bandit grids (delta, Q, pulls, own_p)",
+    )
+    parser.add_argument("--out_local_util_grid", type=str, default="artifacts/ablations/bandit_local_util_grid.png")
     parser.add_argument(
         "--n_agents",
         type=int,
@@ -427,7 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit_conflict_arms",
         type=str,
-        default="randomwalk3,freeze_tag,wait3,move_clear,backward3",
+        default=BANDIT_CONFLICT_ARMS_CSV,
     )
     return parser
 

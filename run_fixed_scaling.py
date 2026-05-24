@@ -16,6 +16,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from swarm.config import ENABLED_CONFLICT_ARM_NAMES
+
 _TRAIN_SYMBOLS: tuple[object, object] | None = None
 
 
@@ -75,17 +77,7 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         "avg_p_time_percent",
         "avg_c_time_percent",
         "avg_conflict_percent",
-        "arm_wait3_prob",
-        "arm_backward3_prob",
-        "arm_randomwalk3_prob",
-        "arm_wait2_forward1_prob",
-        "arm_move_clear_prob",
-        "arm_handshake_prob",
-        "arm_reserve_parity_prob",
-        "arm_reserve_parity_escape_prob",
-        "arm_priority_swap_n3_prob",
-        "arm_pass_food_n3_prob",
-        "arm_freeze_tag_prob",
+        *[f"arm_{name}_prob" for name in ENABLED_CONFLICT_ARM_NAMES],
     ]
     if task["resume"]:
         resumed_last = _load_last_row_if_complete(
@@ -133,7 +125,7 @@ def _execute_tasks(tasks: list[dict], num_workers: int) -> list[tuple[int, dict[
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fixed_conflict_action", type=str, default="reserve_parity_escape")
+    parser.add_argument("--fixed_conflict_action", type=str, default="move_clear")
     parser.add_argument("--agent_counts", type=str, default="1,2,5,7,10,15,20,25,30,35,40")
     parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--episodes", type=int, default=200)

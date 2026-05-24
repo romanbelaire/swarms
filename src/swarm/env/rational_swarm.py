@@ -44,7 +44,8 @@ class RationalSwarmForagingEnv(ParallelEnv):
     immunity / freeze durations are exposed in ``infos``, not appended to observations, so frozen
     task experts trained at the legacy ``OBS_DIM`` still load without shape mismatch.
 
-    **Freeze / immunity:** ``agent_freeze_remaining`` freezes movement. ``agent_immune_priority`` is
+    **Freeze / immunity:** ``agent_freeze_remaining`` freezes movement and counts each frozen step as
+    conflict (``C_time`` / ``c_t``). ``agent_immune_priority`` is
     ``0`` normally; when immunity is granted it becomes a positive ticket (tie-break elsewhere).
     Immune agents run **as a perceptual ghost for one food haul**: observations mask all other
     agents as empty tiles (base/food/obstacle framing unchanged); they skip avoidance lockout,
@@ -289,8 +290,8 @@ class RationalSwarmForagingEnv(ParallelEnv):
             current_pos = self.agent_positions[agent]
 
             if self.agent_freeze_remaining[agent] > 0:
-                self.agent_modes[agent] = "program"
-                self.P_time[agent] += 1
+                self.agent_modes[agent] = "avoidance"
+                self.C_time[agent] += 1
                 next_positions[agent] = list(current_pos)
                 continue
 
