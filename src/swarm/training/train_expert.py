@@ -22,6 +22,10 @@ if __package__ is None:
 
 from swarm.agents import DEVICE, DQNAgent
 from swarm.config import (
+    ENV_LAYOUT_DUAL_QUADRANT_BASE,
+    ENV_LAYOUT_NAMES,
+    DEFAULT_ENV_LAYOUT,
+    EXPERT_CHECKPOINT_DUAL_QUADRANT_BASE,
     GRID_SIZE,
     EXPERT_DEFAULT_MAX_STEPS_PER_EPISODE,
     EXPERT_EVAL_EVERY_EPISODES,
@@ -109,15 +113,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval_rollouts", type=int, default=30, help="Greedy episodes averaged for eval.")
     p.add_argument("--metrics_csv", type=str, default="artifacts/expert/expert_training_metrics.csv")
     p.add_argument(
+        "--env_layout",
+        type=str,
+        default=DEFAULT_ENV_LAYOUT,
+        choices=ENV_LAYOUT_NAMES,
+        help="Base placement for expert training (must match ablation --env_layout).",
+    )
+    p.add_argument(
         "--out",
         type=str,
-        default="artifacts/expert/dqn_weights_agent_0.pt",
+        default=None,
         help="Where to save agent_0 Q-network weights (FrozenTaskExpert checkpoint).",
     )
     return p
 
 
 def run_expert_training(args) -> None:
+    if args.out is None:
+        args.out = (
+            EXPERT_CHECKPOINT_DUAL_QUADRANT_BASE
+            if args.env_layout == ENV_LAYOUT_DUAL_QUADRANT_BASE
+            else "artifacts/expert/dqn_weights_agent_0.pt"
+        )
     n_agents = args.n_agents
     num_envs = args.num_envs
     if n_agents <= 0:
@@ -135,6 +152,7 @@ def run_expert_training(args) -> None:
         grid_size=GRID_SIZE,
         num_food=NUM_FOOD,
         local_grid_size=5,
+        env_layout=args.env_layout,
     )
     env0_agents = vec_env.possible_agents
 
@@ -157,7 +175,12 @@ def run_expert_training(args) -> None:
     }
 
     eval_env = RationalSwarmForagingEnv(
-        n_agents=n_agents, grid_size=GRID_SIZE, num_food=NUM_FOOD, local_grid_size=5, render_mode=None
+        n_agents=n_agents,
+        grid_size=GRID_SIZE,
+        num_food=NUM_FOOD,
+        local_grid_size=5,
+        render_mode=None,
+        env_layout=args.env_layout,
     )
 
     episode_metrics = []

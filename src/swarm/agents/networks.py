@@ -60,8 +60,8 @@ class DRScenarioMixtureNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        self.self_role_logits = nn.Linear(hidden_dim, 3)
-        self.others_model_logits = nn.Linear(hidden_dim, 3)
+        self.self_role_logits = nn.Linear(hidden_dim, 2)
+        self.others_model_logits = nn.Linear(hidden_dim, 2)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.trunk(x.float())

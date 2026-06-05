@@ -24,12 +24,18 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from run_ablations import _load_last_row, _load_last_row_if_complete, _parse_int_list
-from swarm.config import BANDIT_CONFLICT_ARMS_CSV, ENABLED_CONFLICT_ARM_NAMES
+from swarm.config import (
+    BANDIT_CONFLICT_ARMS_CSV,
+    DEFAULT_ENV_LAYOUT,
+    ENABLED_CONFLICT_ARM_NAMES,
+    ENV_LAYOUT_NAMES,
+    ablation_run_name_suffix,
+)
 
 _TRAIN_SYMBOLS = None
 
 CREDIT_TRIALS = ("per_arm_credited", "arm_relative_my_role", "step_level")
-OTHERS_SUFFIXES = ("allsame", "allp", "allc")
+OTHERS_SUFFIXES = ("allp", "allc")
 BANDIT_ARMS = ENABLED_CONFLICT_ARM_NAMES
 DEFAULT_OUT_ROOT = "artifacts/my_role_credit_ablations"
 DEFAULT_FIXED_SUMMARY_CSV = "artifacts/ablations/fixed_conflict_baselines_once.csv"
@@ -59,12 +65,17 @@ def _run_and_collect(
     baseline_mode: str,
     fixed_conflict_action: str,
     bandit_reward_model: str,
+    bandit_algorithm: str,
+    bandit_gradient_alpha: float,
+    bandit_linucb_alpha: float,
+    bandit_lin_ts_v: float,
     bandit_conflict_arms: str,
     bandit_credit_mode: str,
     resume: bool,
     grid_size: int,
     num_food: int,
     local_grid_size: int,
+    env_layout: str,
 ) -> dict[str, float]:
     metrics_path = out_dir / f"{run_name}.csv"
     _, _, run_training = _get_train_symbols()
@@ -97,6 +108,10 @@ def _run_and_collect(
     run_args["baseline_mode"] = baseline_mode
     run_args["fixed_conflict_action"] = fixed_conflict_action
     run_args["bandit_reward_model"] = bandit_reward_model
+    run_args["bandit_algorithm"] = bandit_algorithm
+    run_args["bandit_gradient_alpha"] = bandit_gradient_alpha
+    run_args["bandit_linucb_alpha"] = bandit_linucb_alpha
+    run_args["bandit_lin_ts_v"] = bandit_lin_ts_v
     run_args["bandit_conflict_arms"] = bandit_conflict_arms
     run_args["bandit_credit_mode"] = bandit_credit_mode
     run_args["expert_checkpoint"] = expert_checkpoint
@@ -105,6 +120,7 @@ def _run_and_collect(
     run_args["grid_size"] = grid_size
     run_args["num_food"] = num_food
     run_args["local_grid_size"] = local_grid_size
+    run_args["env_layout"] = env_layout
     print(f"Running {run_name}")
     run_training(SimpleNamespace(**run_args))
     return _load_last_row(metrics_path)
@@ -129,12 +145,17 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         baseline_mode=task["baseline_mode"],
         fixed_conflict_action=task["fixed_conflict_action"],
         bandit_reward_model=task["bandit_reward_model"],
+        bandit_algorithm=task["bandit_algorithm"],
+        bandit_gradient_alpha=task["bandit_gradient_alpha"],
+        bandit_linucb_alpha=task["bandit_linucb_alpha"],
+        bandit_lin_ts_v=task["bandit_lin_ts_v"],
         bandit_conflict_arms=task["bandit_conflict_arms"],
         bandit_credit_mode=task["bandit_credit_mode"],
         resume=task["resume"],
         grid_size=task["grid_size"],
         num_food=task["num_food"],
         local_grid_size=task["local_grid_size"],
+        env_layout=task["env_layout"],
     )
     return int(task["task_idx"]), last
 
@@ -179,6 +200,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--cpu", action="store_true")
+    from swarm.training.train import BANDIT_ALGORITHM_NAMES
+
+    parser.add_argument(
+        "--bandit_algorithm",
+        type=str,
+        default="ucbv",
+        choices=BANDIT_ALGORITHM_NAMES,
+        help="Bandit algorithm for DR reward-model credit ablations.",
+    )
+    parser.add_argument("--bandit_gradient_alpha", type=float, default=0.1)
+    parser.add_argument("--bandit_linucb_alpha", type=float, default=1.0)
+    parser.add_argument("--bandit_lin_ts_v", type=float, default=1.0)
     parser.add_argument(
         "--credit_modes",
         type=str,
@@ -197,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip_bandit", action="store_true")
     parser.add_argument("--skip_plots", action="store_true")
+    parser.add_argument(
+        "--env_layout",
+        type=str,
+        default=DEFAULT_ENV_LAYOUT,
+        choices=ENV_LAYOUT_NAMES,
+    )
     return parser
 
 
@@ -214,6 +253,7 @@ def main():
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    layout_suffix = ablation_run_name_suffix(args.env_layout)
     fixed_summary_path = Path(args.fixed_summary_csv)
     fixed_conflict_actions = list(BANDIT_ARMS)
 
@@ -225,12 +265,13 @@ def main():
         fixed_task_idx = 0
         for n_agents in agent_counts:
             for action_name in fixed_conflict_actions:
-                run_name = f"fixed_once_{action_name}_agents{n_agents}_seed{fixed_once_seed}"
+                run_name = f"fixed_once_{action_name}{layout_suffix}_agents{n_agents}_seed{fixed_once_seed}"
                 fixed_tasks.append(
                     {
                         "task_idx": fixed_task_idx,
                         "out_dir": str(fixed_dir),
                         "run_name": run_name,
+                        "env_layout": args.env_layout,
                         "n_agents": n_agents,
                         "seed": fixed_once_seed,
                         "episodes": args.episodes,
@@ -243,7 +284,11 @@ def main():
                         "expert_checkpoint": args.expert_checkpoint,
                         "baseline_mode": "fixed_conflict",
                         "fixed_conflict_action": action_name,
-                        "bandit_reward_model": "neutral_allsame",
+                        "bandit_reward_model": "solver_allc",
+                        "bandit_algorithm": args.bandit_algorithm,
+                        "bandit_gradient_alpha": args.bandit_gradient_alpha,
+                        "bandit_linucb_alpha": args.bandit_linucb_alpha,
+                        "bandit_lin_ts_v": args.bandit_lin_ts_v,
                         "bandit_conflict_arms": "",
                         "bandit_credit_mode": "episode_shared",
                         "resume": args.resume,
@@ -291,12 +336,16 @@ def main():
             for seed in seeds:
                 for reward_model in bandit_reward_model_names:
                     my_role, others_role = _split_reward_model(reward_model)
-                    run_name = f"dr_{reward_model}_{credit_mode}_agents{n_agents}_seed{seed}"
+                    run_name = (
+                        f"dr_{args.bandit_algorithm}_{reward_model}_{credit_mode}"
+                        f"{layout_suffix}_agents{n_agents}_seed{seed}"
+                    )
                     main_tasks.append(
                         {
                             "task_idx": task_idx,
                             "out_dir": str(runs_dir),
                             "run_name": run_name,
+                            "env_layout": args.env_layout,
                             "n_agents": n_agents,
                             "seed": seed,
                             "episodes": args.episodes,
@@ -310,6 +359,10 @@ def main():
                             "baseline_mode": "bandit_ucb1",
                             "fixed_conflict_action": "backwards2",
                             "bandit_reward_model": reward_model,
+                            "bandit_algorithm": args.bandit_algorithm,
+                            "bandit_gradient_alpha": args.bandit_gradient_alpha,
+                            "bandit_linucb_alpha": args.bandit_linucb_alpha,
+                            "bandit_lin_ts_v": args.bandit_lin_ts_v,
                             "bandit_conflict_arms": args.bandit_conflict_arms,
                             "bandit_credit_mode": credit_mode,
                             "resume": args.resume,
@@ -324,8 +377,9 @@ def main():
         for task, (_, last) in zip(main_tasks, main_results):
             row = {
                 "run_name": str(task["run_name"]),
-                "method": f"dr_{task['reward_model']}_{credit_mode}",
+                "method": f"dr_{task['bandit_algorithm']}_{task['reward_model']}_{credit_mode}",
                 "bandit_credit_mode": credit_mode,
+                "bandit_algorithm": str(task["bandit_algorithm"]),
                 "bandit_reward_model": str(task["reward_model"]),
                 "my_role": str(task["my_role"]),
                 "others_role": str(task["others_role"]),

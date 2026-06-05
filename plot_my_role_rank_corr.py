@@ -19,12 +19,10 @@ if str(SRC) not in sys.path:
 
 from swarm.config import BANDIT_CONFLICT_ARMS_CSV
 
-MY_ROLES = ("solver", "neutral", "causer")
-OTHERS_ROLES = ("allc", "allp", "allsame")
+MY_ROLES = ("solver", "causer")
+OTHERS_ROLES = ("allc", "allp")
 MY_ROLE_PAIRS = (
-    ("solver", "neutral", "solver vs neutral"),
     ("solver", "causer", "solver vs causer"),
-    ("neutral", "causer", "neutral vs causer"),
 )
 
 
@@ -132,7 +130,7 @@ def plot_credit_mode_trial(
     agent_counts = sorted({int(row["n_agents"]) for row in rows})
     seeds = sorted({int(row["seed"]) for row in rows})
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     for ax, others_role in zip(axes, OTHERS_ROLES):
         xs, means, stds = _aggregate_curve(rows, arms, others_role=others_role, agent_counts=agent_counts, seeds=seeds)
         x_arr = np.array(xs, dtype=np.float64)
@@ -193,7 +191,7 @@ def _plot_fixed_alignment(
     agent_counts: list[int],
     seeds: list[int],
 ):
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     for ax, others_role in zip(axes, OTHERS_ROLES):
         xs = agent_counts
         for my_role in MY_ROLES:

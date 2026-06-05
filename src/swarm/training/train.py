@@ -16,6 +16,7 @@ from swarm.env import RationalSwarmForagingEnv
 from swarm.conflict_instances import (
     ClosedConflictInstance,
     ConflictInstanceTracker,
+    episode_closed_conflict_instance_count,
     episode_mean_own_p_norm,
     episode_mean_own_p_norm_all_envs,
     episode_mean_local_util_norm,
@@ -23,7 +24,20 @@ from swarm.conflict_instances import (
     new_conflict_trackers,
     step_local_utility_mean,
 )
-from swarm.agents import DQNAgent, DEVICE, FrozenTaskExpert, PCCriticLearner, DRScenarioMixtureLearner, UCB1Bandit, DRUCBPolicyLearner
+from swarm.agents import (
+    DQNAgent,
+    DEVICE,
+    FrozenTaskExpert,
+    PCCriticLearner,
+    DRScenarioMixtureLearner,
+    UCB1Bandit,
+    UCBVBandit,
+    GaussianThompsonSamplingBandit,
+    GradientBandit,
+    LinUCBBandit,
+    LinThompsonSamplingBandit,
+    DRUCBPolicyLearner,
+)
 from swarm.config import (
     N_EPISODES,
     MAX_STEPS_PER_EPISODE,
@@ -48,6 +62,8 @@ from swarm.config import (
     MAX_CONFLICT_STEPS,
     MAX_CONFLICT_STEPS_TYPE,
     FULL_DURATION_NORM,
+    ENV_LAYOUT_NAMES,
+    DEFAULT_ENV_LAYOUT,
 )
 
 CONFLICT_ACTION_NAMES = list(ENABLED_CONFLICT_ARM_NAMES)
@@ -63,13 +79,8 @@ CONFLICT_ACTION_ALIASES = {
 BANDIT_REWARD_MODEL_NAMES = [
     "solver_allc",
     "solver_allp",
-    "solver_allsame",
-    "neutral_allc",
-    "neutral_allp",
-    "neutral_allsame",
     "causer_allc",
     "causer_allp",
-    "causer_allsame",
 ]
 BANDIT_CREDIT_MODE_NAMES = [
     "instance_credited",
@@ -78,6 +89,27 @@ BANDIT_CREDIT_MODE_NAMES = [
     "arm_relative_my_role",
     "step_level",
 ]
+BANDIT_ALGORITHM_NAMES = [
+    "ucbv",
+    "epsilon_greedy",
+    "gaussian_ts",
+    "gradient",
+    "linucb",
+    "lin_ts",
+]
+CONTEXTUAL_BANDIT_ALGORITHMS = frozenset({"linucb", "lin_ts"})
+ConflictBandit = (
+    UCBVBandit
+    | UCB1Bandit
+    | GaussianThompsonSamplingBandit
+    | GradientBandit
+    | LinUCBBandit
+    | LinThompsonSamplingBandit
+)
+
+
+def bandit_algorithm_uses_context(algorithm: str) -> bool:
+    return algorithm in CONTEXTUAL_BANDIT_ALGORITHMS
 
 
 def invert_move(action: int) -> int:
@@ -311,6 +343,10 @@ def _manhattan_distance(position: list[int], base_position: tuple[int, int]) -> 
     return abs(position[0] - base_position[0]) + abs(position[1] - base_position[1])
 
 
+def _manhattan_distance_to_nearest_base(position: list[int], base_positions: tuple[tuple[int, int], ...]) -> int:
+    return min(_manhattan_distance(position, base_pos) for base_pos in base_positions)
+
+
 def resolve_reserve_parity_step(
     reserve_selected: set[str],
     low_actions: dict[str, int],
@@ -399,21 +435,21 @@ def resolve_pass_food_n3_step(
     macro_queues: dict[str, list[int]],
     positions: dict[str, list[int]],
     agent_holding_food: dict[str, bool],
-    base_position: tuple[int, int],
+    base_positions: tuple[tuple[int, int], ...],
     obs_by_agent: dict[str, np.ndarray],
 ):
     proposals_by_receiver: dict[str, list[str]] = {}
     for sender_id in pass_selected:
         if not agent_holding_food[sender_id]:
             continue
-        sender_dist = _manhattan_distance(positions[sender_id], base_position)
+        sender_dist = _manhattan_distance_to_nearest_base(positions[sender_id], base_positions)
         receiver_candidates = []
         for neighbor_id, _ in adjacent_agents(sender_id, positions):
             if neighbor_id not in pass_selected:
                 continue
             if agent_holding_food[neighbor_id]:
                 continue
-            receiver_dist = _manhattan_distance(positions[neighbor_id], base_position)
+            receiver_dist = _manhattan_distance_to_nearest_base(positions[neighbor_id], base_positions)
             if receiver_dist < sender_dist:
                 receiver_candidates.append((receiver_dist, neighbor_id))
         if len(receiver_candidates) == 0:
@@ -549,6 +585,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid_size", type=int, default=GRID_SIZE, help="Environment grid size")
     parser.add_argument("--num_food", type=int, default=NUM_FOOD, help="Number of food pellets present")
     parser.add_argument("--local_grid_size", type=int, default=LOCAL_GRID_SIZE, help="Local observation window size")
+    parser.add_argument(
+        "--env_layout",
+        type=str,
+        default=DEFAULT_ENV_LAYOUT,
+        choices=ENV_LAYOUT_NAMES,
+        help="Base placement: center_base (single center) or dual_quadrant_base (opposite quadrant centers).",
+    )
     parser.add_argument("--alpha", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.999, help="Discount factor")
     parser.add_argument("--epsilon_decay", type=int, default=1000, help="Steps over which epsilon decays to min")
@@ -586,9 +629,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit_reward_model",
         type=str,
-        default="neutral_allsame",
+        default="solver_allc",
         choices=BANDIT_REWARD_MODEL_NAMES,
-        help="DR reward model used for UCB1 bandit updates in baseline mode.",
+        help="DR reward model used for bandit updates in baseline mode.",
+    )
+    parser.add_argument(
+        "--bandit_algorithm",
+        type=str,
+        default="ucbv",
+        choices=BANDIT_ALGORITHM_NAMES,
+        help="Conflict-arm bandit algorithm (default ucbv = variance-aware UCB).",
+    )
+    parser.add_argument(
+        "--bandit_gradient_alpha",
+        type=float,
+        default=0.1,
+        help="Learning rate for gradient bandit preference updates.",
+    )
+    parser.add_argument(
+        "--bandit_linucb_alpha",
+        type=float,
+        default=1.0,
+        help="Exploration scale for disjoint LinUCB.",
+    )
+    parser.add_argument(
+        "--bandit_lin_ts_v",
+        type=float,
+        default=1.0,
+        help="Posterior sampling scale for disjoint linear Thompson sampling.",
     )
     parser.add_argument(
         "--bandit_conflict_arms",
@@ -708,27 +776,18 @@ def _bandit_dr_delta_raw(
     model_name: str,
     *,
     local_utility_mean: float,
-    own_p_mean: float,
+    self_util: float,
+    n_agents: int,
 ) -> float:
     fd = float(FULL_DURATION_NORM)
     if model_name == "solver_allc":
-        return 0.0
-    if model_name == "solver_allp":
-        return fd
-    if model_name == "solver_allsame":
         return float(local_utility_mean)
-    if model_name == "neutral_allc":
-        return float(-own_p_mean)
-    if model_name == "neutral_allp":
-        return float(fd - own_p_mean)
-    if model_name == "neutral_allsame":
-        return float(local_utility_mean - own_p_mean)
+    if model_name == "solver_allp":
+        return float(local_utility_mean + self_util)
     if model_name == "causer_allc":
-        return float(-fd)
+        return float(self_util)
     if model_name == "causer_allp":
-        return 0.0
-    if model_name == "causer_allsame":
-        return float(local_utility_mean - fd)
+        return float(local_utility_mean - fd * (n_agents - 1))
     raise ValueError(f"Unknown bandit_reward_model: {model_name}")
 
 
@@ -736,20 +795,35 @@ def _bandit_reward_from_episode(
     model_name: str,
     *,
     local_utility_mean: float,
-    own_p_mean: float,
+    self_util: float,
+    n_agents: int,
 ) -> float:
     return _dr_softplus(
         _bandit_dr_delta_raw(
             model_name,
             local_utility_mean=local_utility_mean,
-            own_p_mean=own_p_mean,
+            self_util=self_util,
+            n_agents=n_agents,
         )
     )
 
 
+def _episode_mean_self_util_all_envs(
+    conflict_trackers_by_env: list[dict[str, ConflictInstanceTracker]],
+    agent_ids: list[str],
+) -> float:
+    values = [
+        conflict_trackers_by_env[env_idx][agent_id].mean_closed_p_norm()
+        - conflict_trackers_by_env[env_idx][agent_id].mean_closed_c_norm()
+        for env_idx in range(len(conflict_trackers_by_env))
+        for agent_id in agent_ids
+    ]
+    return float(np.mean(values))
+
+
 def _new_episode_arm_stats(agent_ids: list[str], arm_names: tuple[str, ...]) -> dict[str, dict[str, dict[str, list[float]]]]:
     return {
-        agent_id: {arm_name: {"own_p": [], "local_util": []} for arm_name in arm_names}
+        agent_id: {arm_name: {"own_p": [], "own_c": [], "local_util": []} for arm_name in arm_names}
         for agent_id in agent_ids
     }
 
@@ -764,13 +838,38 @@ def _mean_arm_stat(samples: list[float]) -> float:
     return _mean_or_nan(samples)
 
 
-def _new_ucb_bandit(n_arms: int, args) -> UCB1Bandit:
-    return UCB1Bandit(
-        n_arms,
-        epsilon_start=args.bandit_epsilon_start,
-        epsilon_end=args.bandit_epsilon_end,
-        epsilon_decay_steps=args.bandit_epsilon_decay,
-    )
+def _new_ucb_bandit(n_arms: int, args, obs_dim: int = OBS_DIM) -> ConflictBandit:
+    if args.bandit_algorithm == "ucbv":
+        return UCBVBandit(n_arms)
+    if args.bandit_algorithm == "epsilon_greedy":
+        return UCB1Bandit(
+            n_arms,
+            epsilon_start=args.bandit_epsilon_start,
+            epsilon_end=args.bandit_epsilon_end,
+            epsilon_decay_steps=args.bandit_epsilon_decay,
+        )
+    if args.bandit_algorithm == "gaussian_ts":
+        return GaussianThompsonSamplingBandit(n_arms)
+    if args.bandit_algorithm == "gradient":
+        return GradientBandit(n_arms, alpha=args.bandit_gradient_alpha)
+    if args.bandit_algorithm == "linucb":
+        return LinUCBBandit(n_arms, obs_dim=obs_dim, alpha=args.bandit_linucb_alpha)
+    if args.bandit_algorithm == "lin_ts":
+        return LinThompsonSamplingBandit(n_arms, obs_dim=obs_dim, v=args.bandit_lin_ts_v)
+    raise ValueError(f"Unknown bandit_algorithm: {args.bandit_algorithm}")
+
+
+def _validate_bandit_configuration(args) -> None:
+    if args.baseline_mode not in ("bandit_ucb1", "dr_ucb_mixture"):
+        return
+    if not bandit_algorithm_uses_context(args.bandit_algorithm):
+        return
+    if args.bandit_credit_mode not in ("instance_credited", "step_level"):
+        raise ValueError(
+            f"bandit_algorithm={args.bandit_algorithm!r} requires bandit_credit_mode "
+            "instance_credited or step_level; got "
+            f"{args.bandit_credit_mode!r}"
+        )
 
 
 def _new_training_arm_samples(bandit_arm_names: tuple[str, ...]) -> dict[str, dict[str, list[float]]]:
@@ -783,7 +882,7 @@ def _new_training_arm_samples(bandit_arm_names: tuple[str, ...]) -> dict[str, di
 def _bandit_arm_metric_columns(
     *,
     bandit_arm_names: tuple[str, ...],
-    bandits: dict[str, UCB1Bandit],
+    bandits: dict[str, ConflictBandit],
     agent_ids: list[str],
     training_arm_samples: dict[str, dict[str, list[float]]],
     episode_arm_counts: dict[str, int],
@@ -847,30 +946,33 @@ def _record_closed_conflict_instance(
     episode_own_p_by_agent[agent_id].append(closed.p_norm)
     if episode_arm_stats is not None and arm_name is not None:
         episode_arm_stats[agent_id][arm_name]["own_p"].append(closed.p_norm)
+        episode_arm_stats[agent_id][arm_name]["own_c"].append(closed.c_norm)
         episode_arm_stats[agent_id][arm_name]["local_util"].append(closed.local_util_norm)
 
 
 def _credit_bandit_conflict_instance(
     *,
-    bandits: dict[str, UCB1Bandit],
+    bandits: dict[str, ConflictBandit],
     bandit_arm_names: tuple[str, ...],
     bandit_reward_model: str,
     agent_id: str,
     arm_name: str,
     closed: ClosedConflictInstance,
+    n_agents: int,
 ):
     arm_idx = bandit_arm_names.index(arm_name)
     reward = _bandit_reward_from_episode(
         bandit_reward_model,
         local_utility_mean=closed.local_util_norm,
-        own_p_mean=closed.p_norm,
+        self_util=closed.p_norm - closed.c_norm,
+        n_agents=n_agents,
     )
     bandits[agent_id].update(arm_idx, reward)
 
 
 def _credit_dr_ucb_mixture_instance(
     *,
-    nested_bandits: dict[str, dict[str, UCB1Bandit]],
+    nested_bandits: dict[str, dict[str, ConflictBandit]],
     dr_policies: dict[str, DRUCBPolicyLearner],
     bandit_arm_names: tuple[str, ...],
     agent_id: str,
@@ -879,12 +981,14 @@ def _credit_dr_ucb_mixture_instance(
     dr_idx: int,
     meta_obs: np.ndarray,
     closed: ClosedConflictInstance,
+    n_agents: int,
 ) -> float | None:
     arm_idx = bandit_arm_names.index(arm_name)
     reward = _bandit_reward_from_episode(
         dr_name,
         local_utility_mean=closed.local_util_norm,
-        own_p_mean=closed.p_norm,
+        self_util=closed.p_norm - closed.c_norm,
+        n_agents=n_agents,
     )
     nested_bandits[agent_id][dr_name].update(arm_idx, reward)
     dr_policies[agent_id].store(meta_obs, dr_idx, reward)
@@ -901,7 +1005,8 @@ def _handle_closed_conflict_instance(
     episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]] | None,
     agent_id: str,
     arm_name: str | None,
-    bandits: dict[str, UCB1Bandit] | None = None,
+    n_agents: int,
+    bandits: dict[str, ConflictBandit] | None = None,
     bandit_arm_names: tuple[str, ...] | None = None,
     bandit_reward_model: str | None = None,
     bandit_credit_mode: str | None = None,
@@ -925,12 +1030,14 @@ def _handle_closed_conflict_instance(
         reward = _bandit_reward_from_episode(
             bandit_reward_model,
             local_utility_mean=closed.local_util_norm,
-            own_p_mean=closed.p_norm,
+            self_util=closed.p_norm - closed.c_norm,
+            n_agents=n_agents,
         )
         delta = _bandit_dr_delta_raw(
             bandit_reward_model,
             local_utility_mean=closed.local_util_norm,
-            own_p_mean=closed.p_norm,
+            self_util=closed.p_norm - closed.c_norm,
+            n_agents=n_agents,
         )
         training_arm_samples[arm_name]["reward"].append(reward)
         training_arm_samples[arm_name]["delta"].append(delta)
@@ -950,26 +1057,29 @@ def _handle_closed_conflict_instance(
             agent_id=agent_id,
             arm_name=arm_name,
             closed=closed,
+            n_agents=n_agents,
         )
 
 
 def _apply_bandit_episode_updates(
     *,
-    bandits: dict[str, UCB1Bandit],
+    bandits: dict[str, ConflictBandit],
     bandit_arm_names: tuple[str, ...],
     bandit_reward_model: str,
     bandit_credit_mode: str,
     episode_arm_stats: dict[str, dict[str, dict[str, list[float]]]],
     conflict_trackers_by_env: list[dict[str, ConflictInstanceTracker]],
     agent_ids: list[str],
+    n_agents: int,
 ):
     local_utility_mean_episode = episode_mean_local_util_norm_all_envs(conflict_trackers_by_env, agent_ids)
     if bandit_credit_mode == "episode_shared":
-        own_p_mean_episode = episode_mean_own_p_norm_all_envs(conflict_trackers_by_env, agent_ids)
+        self_util_episode = _episode_mean_self_util_all_envs(conflict_trackers_by_env, agent_ids)
         reward_for_update = _bandit_reward_from_episode(
             bandit_reward_model,
             local_utility_mean=local_utility_mean_episode,
-            own_p_mean=own_p_mean_episode,
+            self_util=self_util_episode,
+            n_agents=n_agents,
         )
         for agent_id in agent_ids:
             for arm_idx, arm_name in enumerate(bandit_arm_names):
@@ -978,33 +1088,111 @@ def _apply_bandit_episode_updates(
         return
 
     for agent_id in agent_ids:
-        own_p_episode = float(
-            np.mean([conflict_trackers_by_env[env_idx][agent_id].mean_closed_p_norm() for env_idx in range(len(conflict_trackers_by_env))])
+        self_util_episode = float(
+            np.mean([
+                conflict_trackers_by_env[env_idx][agent_id].mean_closed_p_norm()
+                - conflict_trackers_by_env[env_idx][agent_id].mean_closed_c_norm()
+                for env_idx in range(len(conflict_trackers_by_env))
+            ])
         )
         for arm_idx, arm_name in enumerate(bandit_arm_names):
             arm_samples = episode_arm_stats[agent_id][arm_name]
             if len(arm_samples["own_p"]) == 0:
                 continue
             own_p_k = _mean_arm_stat(arm_samples["own_p"])
+            own_c_k = _mean_arm_stat(arm_samples["own_c"])
             if bandit_credit_mode == "per_arm_credited":
                 local_k = _mean_arm_stat(arm_samples["local_util"])
                 reward_k = _bandit_reward_from_episode(
                     bandit_reward_model,
                     local_utility_mean=local_k,
-                    own_p_mean=own_p_k,
+                    self_util=own_p_k - own_c_k,
+                    n_agents=n_agents,
                 )
             elif bandit_credit_mode == "arm_relative_my_role":
                 delta = _bandit_dr_delta_raw(
                     bandit_reward_model,
                     local_utility_mean=local_utility_mean_episode,
-                    own_p_mean=own_p_episode,
+                    self_util=self_util_episode,
+                    n_agents=n_agents,
                 )
-                if bandit_reward_model.startswith("neutral_"):
-                    delta += float(own_p_episode - own_p_k)
                 reward_k = _dr_softplus(delta)
             else:
                 raise ValueError(f"Unsupported bandit_credit_mode in episode update: {bandit_credit_mode}")
             bandits[agent_id].update(arm_idx, reward_k)
+
+
+def conflict_grid_artifact_path(metrics_csv: str | Path) -> Path:
+    metrics_path = Path(metrics_csv)
+    return metrics_path.with_name(f"{metrics_path.stem}_conflict_grid.npz")
+
+
+def conflict_local_density_artifact_path(metrics_csv: str | Path) -> Path:
+    metrics_path = Path(metrics_csv)
+    return metrics_path.with_name(f"{metrics_path.stem}_conflict_local_density.npz")
+
+
+def _record_conflict_grid_step(
+    conflict_grid: np.ndarray,
+    *,
+    agent_ids: list[str],
+    positions: dict[str, list[int]],
+    n_local_by_agent: dict[str, float],
+) -> None:
+    for agent_id in agent_ids:
+        if n_local_by_agent[agent_id] > 1.0:
+            x, y = positions[agent_id]
+            conflict_grid[x, y] += 1
+
+
+def _save_conflict_grid(metrics_csv: str | Path, conflict_grid: np.ndarray, grid_size: int) -> None:
+    out_path = conflict_grid_artifact_path(metrics_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, counts=conflict_grid, grid_size=np.int32(grid_size))
+    print(f"Saved conflict location grid to {out_path}")
+
+
+def _record_conflict_local_density_step(
+    density_grid: np.ndarray,
+    *,
+    agent_ids: list[str],
+    obs_by_agent: dict[str, np.ndarray],
+    local_grid_size: int,
+    arm_density_grids: dict[str, np.ndarray],
+    active_arms_by_agent: dict[str, str | None],
+) -> None:
+    n_tiles = local_grid_size * local_grid_size
+    for agent_id in agent_ids:
+        obs = obs_by_agent[agent_id]
+        tiles = obs[:n_tiles].reshape(local_grid_size, local_grid_size)
+        for i in range(local_grid_size):
+            for j in range(local_grid_size):
+                cell = tiles[i, j]
+                if cell != 3.0 and cell != 4.0:
+                    continue
+                density_grid[i, j] += 1
+                arm_name = active_arms_by_agent[agent_id]
+                if arm_name is not None and arm_name in arm_density_grids:
+                    arm_density_grids[arm_name][i, j] += 1
+
+
+def _save_conflict_local_density(
+    metrics_csv: str | Path,
+    density_grid: np.ndarray,
+    local_grid_size: int,
+    arm_density_grids: dict[str, np.ndarray] | None,
+) -> None:
+    out_path = conflict_local_density_artifact_path(metrics_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, np.ndarray] = {
+        "counts": density_grid,
+        "local_grid_size": np.int32(local_grid_size),
+    }
+    if arm_density_grids is not None:
+        for arm_name, arm_grid in arm_density_grids.items():
+            payload[f"arm_{arm_name}_counts"] = arm_grid
+    np.savez_compressed(out_path, **payload)
+    print(f"Saved conflict local density grid to {out_path}")
 
 
 def _expert_actions_for_requests(
@@ -1042,6 +1230,7 @@ def _run_baseline(args):
             local_grid_size=local_grid_size,
             render_mode=None,
             suppress_agent_collision=suppress_collision,
+            env_layout=args.env_layout,
         )
         for _ in range(num_envs)
     ]
@@ -1050,6 +1239,7 @@ def _run_baseline(args):
     bandit_arm_names: tuple[str, ...] = tuple(CONFLICT_ACTION_NAMES)
     bandits = {}
     dr_policies: dict[str, DRUCBPolicyLearner] = {}
+    _validate_bandit_configuration(args)
     if args.baseline_mode == "bandit_ucb1":
         bandit_arm_names = baseline_bandit_arms_tuple(args.bandit_conflict_arms)
         bandits = {
@@ -1085,6 +1275,15 @@ def _run_baseline(args):
     episode_metrics = []
     episode_env_rewards = []
     episode_env_rewards_raw = []
+    run_conflict_grid = np.zeros((grid_size, grid_size), dtype=np.int64)
+    run_conflict_local_density = np.zeros((local_grid_size, local_grid_size), dtype=np.int64)
+    track_arm_conflict_local_density = args.baseline_mode == "bandit_ucb1"
+    run_arm_conflict_local_density: dict[str, np.ndarray] | None = None
+    if track_arm_conflict_local_density:
+        run_arm_conflict_local_density = {
+            arm_name: np.zeros((local_grid_size, local_grid_size), dtype=np.int64)
+            for arm_name in bandit_arm_names
+        }
     for episode in range(n_episodes):
         obs_list = []
         for env_idx in range(num_envs):
@@ -1172,13 +1371,15 @@ def _run_baseline(args):
                     elif args.baseline_mode == "fixed_conflict":
                         action_name = args.fixed_conflict_action
                     elif args.baseline_mode == "bandit_ucb1":
-                        selected_arm_idx = int(bandits[agent_id].select_arm())
+                        bandit_obs = obs_list[env_idx][agent_id]
+                        selected_arm_idx = int(bandits[agent_id].select_arm(bandit_obs))
                         action_name = bandit_arm_names[selected_arm_idx]
                         active_conflict_arm[env_idx][agent_id] = action_name
                     elif args.baseline_mode == "dr_ucb_mixture":
                         dr_idx, _ = dr_policies[agent_id].select_dr(obs_list[env_idx][agent_id])
                         dr_name = BANDIT_REWARD_MODEL_NAMES[dr_idx]
-                        selected_arm_idx = int(bandits[agent_id][dr_name].select_arm())
+                        bandit_obs = obs_list[env_idx][agent_id]
+                        selected_arm_idx = int(bandits[agent_id][dr_name].select_arm(bandit_obs))
                         action_name = bandit_arm_names[selected_arm_idx]
                         active_dr_model[env_idx][agent_id] = dr_name
                         active_dr_idx[env_idx][agent_id] = dr_idx
@@ -1266,7 +1467,7 @@ def _run_baseline(args):
                         macro_queues=macro_queues[env_idx],
                         positions=prev_positions_list[env_idx],
                         agent_holding_food=envs[env_idx].agent_holding_food,
-                        base_position=tuple(envs[env_idx].base_position),
+                        base_positions=envs[env_idx].base_positions,
                         obs_by_agent=obs_list[env_idx],
                     )
                 resolve_priority_swap_token_step(
@@ -1286,13 +1487,29 @@ def _run_baseline(args):
                 infos_list.append(infos)
                 episode_env_reward_raw += infos[env0.possible_agents[0]]["env_reward"]
                 new_positions = {a: list(envs[env_idx].agent_positions[a]) for a in env0.possible_agents}
+                n_local_by_agent = {agent_id: float(infos[agent_id]["n_local"]) for agent_id in env0.possible_agents}
+                if args.baseline_mode != "collision_free":
+                    _record_conflict_grid_step(
+                        run_conflict_grid,
+                        agent_ids=env0.possible_agents,
+                        positions=new_positions,
+                        n_local_by_agent=n_local_by_agent,
+                    )
+                _record_conflict_local_density_step(
+                    run_conflict_local_density,
+                    agent_ids=env0.possible_agents,
+                    obs_by_agent=next_obs_list[env_idx],
+                    local_grid_size=local_grid_size,
+                    arm_density_grids=run_arm_conflict_local_density if track_arm_conflict_local_density else {},
+                    active_arms_by_agent=active_conflict_arm[env_idx],
+                )
                 for agent_id in env0.possible_agents:
                     is_c = float(selected_is_c[env_idx][agent_id])
                     if args.baseline_mode == "collision_free":
                         episode_conflict_samples.append(0.0)
                         prev_conflict_flags[env_idx][agent_id] = False
                     else:
-                        has_conflict = float(infos[agent_id]["n_local"] > 1.0)
+                        has_conflict = float(n_local_by_agent[agent_id] > 1.0)
                         episode_conflict_samples.append(has_conflict)
                         prev_conflict_flags[env_idx][agent_id] = bool(has_conflict)
                     tracker = conflict_trackers[env_idx][agent_id]
@@ -1316,6 +1533,7 @@ def _run_baseline(args):
                             episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                             agent_id=agent_id,
                             arm_name=arm_name,
+                            n_agents=n_agents,
                             bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
                             bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
                             bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
@@ -1333,6 +1551,7 @@ def _run_baseline(args):
                                 dr_idx=active_dr_idx[env_idx][agent_id],
                                 meta_obs=active_meta_obs[env_idx][agent_id],
                                 closed=closed,
+                                n_agents=n_agents,
                             )
                             if meta_loss is not None:
                                 episode_dr_meta_losses.append(meta_loss)
@@ -1342,7 +1561,8 @@ def _run_baseline(args):
                             reward_step = _bandit_reward_from_episode(
                                 args.bandit_reward_model,
                                 local_utility_mean=tracker.running_local_util_norm(),
-                                own_p_mean=tracker.running_p_norm(),
+                                self_util=tracker.running_p_norm() - tracker.running_c_norm(),
+                                n_agents=n_agents,
                             )
                             bandits[agent_id].update(arm_idx, reward_step)
                     if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture"):
@@ -1374,6 +1594,7 @@ def _run_baseline(args):
                         episode_arm_stats=episode_arm_stats if args.baseline_mode in ("bandit_ucb1", "dr_ucb_mixture") else None,
                         agent_id=agent_id,
                         arm_name=active_conflict_arm[env_idx][agent_id],
+                        n_agents=n_agents,
                         bandits=bandits if args.baseline_mode == "bandit_ucb1" else None,
                         bandit_arm_names=bandit_arm_names if args.baseline_mode == "bandit_ucb1" else None,
                         bandit_reward_model=args.bandit_reward_model if args.baseline_mode == "bandit_ucb1" else None,
@@ -1391,6 +1612,7 @@ def _run_baseline(args):
                             dr_idx=active_dr_idx[env_idx][agent_id],
                             meta_obs=active_meta_obs[env_idx][agent_id],
                             closed=closed,
+                            n_agents=n_agents,
                         )
                         if meta_loss is not None:
                             episode_dr_meta_losses.append(meta_loss)
@@ -1404,6 +1626,7 @@ def _run_baseline(args):
                 episode_arm_stats=episode_arm_stats,
                 conflict_trackers_by_env=conflict_trackers,
                 agent_ids=env0.possible_agents,
+                n_agents=n_agents,
             )
 
         bandit_method_suffix = (
@@ -1414,9 +1637,14 @@ def _run_baseline(args):
         if args.baseline_mode == "dr_ucb_mixture":
             method_label = f"dr_ucb_mixture_{args.bandit_credit_mode}"
         elif args.baseline_mode == "bandit_ucb1":
-            method_label = f"bandit_ucb1_{bandit_method_suffix}"
+            method_label = f"bandit_{args.bandit_algorithm}_{bandit_method_suffix}"
         else:
             method_label = args.baseline_mode
+        episode_conflict_instance_count = episode_closed_conflict_instance_count(
+            conflict_trackers,
+            env0.possible_agents,
+        )
+        swarm_agent_count = n_agents * num_envs
         metric_row = {
             "episode": episode + 1,
             "method": method_label,
@@ -1431,6 +1659,9 @@ def _run_baseline(args):
             "avg_c_time_percent": float(100.0 * _mean_or_nan(episode_own_c_samples)),
             "avg_conflict_fraction": _mean_or_nan(episode_conflict_samples),
             "avg_conflict_percent": float(100.0 * _mean_or_nan(episode_conflict_samples)),
+            "conflict_agent_step_count": float(sum(episode_conflict_samples)),
+            "conflict_instance_count": float(episode_conflict_instance_count),
+            "mean_conflict_instances_per_agent": float(episode_conflict_instance_count / swarm_agent_count),
             "epsilon": float(eps),
             "policy_loss_mean": np.nan,
             "critic_loss_mean": np.nan,
@@ -1438,16 +1669,15 @@ def _run_baseline(args):
             "dr_meta_loss_mean": _mean_or_nan(episode_dr_meta_losses),
             "dr_mixed_reward_mean": np.nan,
             "u_solver_mean": np.nan,
-            "u_neutral_mean": np.nan,
             "u_causer_mean": np.nan,
             "v_c_mean": np.nan,
             "v_p_mean": np.nan,
-            "v_mean_mean": np.nan,
             "my_mean_mean": np.nan,
             **{f"arm_{name}_count": float(arm_counts[name]) for name in CONFLICT_ACTION_NAMES},
         }
         if args.baseline_mode == "bandit_ucb1":
-            probs = np.mean(np.stack([bandits[a].arm_probabilities() for a in env0.possible_agents], axis=0), axis=0)
+            per_agent_probs = np.stack([bandits[a].arm_probabilities() for a in env0.possible_agents], axis=0)
+            probs = np.mean(per_agent_probs, axis=0)
             values = np.mean(np.stack([bandits[a].values for a in env0.possible_agents], axis=0), axis=0)
             for name in CONFLICT_ACTION_NAMES:
                 metric_row[f"arm_{name}_prob"] = np.nan
@@ -1455,6 +1685,8 @@ def _run_baseline(args):
             for arm_idx, name in enumerate(bandit_arm_names):
                 metric_row[f"arm_{name}_prob"] = float(probs[arm_idx])
                 metric_row[f"arm_{name}_value"] = float(values[arm_idx])
+                for agent_idx in range(n_agents):
+                    metric_row[f"arm_{name}_agent_{agent_idx}_prob"] = float(per_agent_probs[agent_idx, arm_idx])
             metric_row.update(
                 _bandit_arm_metric_columns(
                     bandit_arm_names=bandit_arm_names,
@@ -1507,6 +1739,18 @@ def _run_baseline(args):
         writer.writeheader()
         writer.writerows(episode_metrics)
     print(f"Saved training metrics to {metrics_path}")
+    if run_conflict_local_density.sum() <= 0:
+        raise ValueError("run_conflict_local_density is empty; no other-agent local tiles were recorded")
+    _save_conflict_local_density(
+        args.metrics_csv,
+        run_conflict_local_density,
+        local_grid_size,
+        run_arm_conflict_local_density,
+    )
+    if args.baseline_mode != "collision_free":
+        if run_conflict_grid.sum() <= 0:
+            raise ValueError("run_conflict_grid is empty; no conflict steps were recorded")
+        _save_conflict_grid(args.metrics_csv, run_conflict_grid, grid_size)
 
 
 def run_training(args):
@@ -1539,6 +1783,7 @@ def run_training(args):
             num_food=num_food,
             local_grid_size=local_grid_size,
             render_mode=None,
+            env_layout=args.env_layout,
         )
         for _ in range(num_envs)
     ]
@@ -1588,6 +1833,7 @@ def run_training(args):
         dr_learners = {
             agent_id: DRScenarioMixtureLearner(
                 obs_dim=OBS_DIM,
+                n_agents=n_agents,
                 lr=args.dr_lr,
                 hidden_dim=64,
                 entropy_coef=args.dr_entropy_coef,
@@ -1880,11 +2126,9 @@ def run_training(args):
         critic_losses = []
         dr_losses = []
         dr_u_solver_vals = []
-        dr_u_neutral_vals = []
         dr_u_causer_vals = []
         dr_v_c_vals = []
         dr_v_p_vals = []
-        dr_v_mean_vals = []
         dr_mixed_reward_vals = []
         dr_my_mean_vals = []
 
@@ -1906,11 +2150,9 @@ def run_training(args):
                 )
                 dr_losses.append(float(dr_stats["loss"]))
                 dr_u_solver_vals.append(float(dr_stats["u_solver"]))
-                dr_u_neutral_vals.append(float(dr_stats["u_neutral"]))
                 dr_u_causer_vals.append(float(dr_stats["u_causer"]))
                 dr_v_c_vals.append(float(dr_stats["v_c"]))
                 dr_v_p_vals.append(float(dr_stats["v_p"]))
-                dr_v_mean_vals.append(float(dr_stats["v_mean"]))
                 dr_mixed_reward_vals.append(float(dr_stats["mixed_reward"]))
                 dr_my_mean_vals.append(float(dr_stats["my_mean"]))
 
@@ -1918,6 +2160,11 @@ def run_training(args):
             policies[agent_id].advance_epsilon_episode()
 
         eps = policies[env0.possible_agents[0]].epsilon()
+        episode_conflict_instance_count = episode_closed_conflict_instance_count(
+            conflict_trackers,
+            env0.possible_agents,
+        )
+        swarm_agent_count = n_agents * num_envs
         metric_row = {
             "episode": episode + 1,
             "method": "dqn_dr" if args.reward_mode == "scenario_mixture" else "dqn_mean_dr",
@@ -1931,17 +2178,18 @@ def run_training(args):
             "avg_c_time_percent": float(100.0 * _mean_or_nan(episode_own_c_samples)),
             "avg_conflict_fraction": _mean_or_nan(episode_conflict_samples),
             "avg_conflict_percent": float(100.0 * _mean_or_nan(episode_conflict_samples)),
+            "conflict_agent_step_count": float(sum(episode_conflict_samples)),
+            "conflict_instance_count": float(episode_conflict_instance_count),
+            "mean_conflict_instances_per_agent": float(episode_conflict_instance_count / swarm_agent_count),
             "epsilon": float(eps),
             "policy_loss_mean": _mean_or_nan(policy_losses),
             "critic_loss_mean": float(np.mean(critic_losses)) if len(critic_losses) > 0 else np.nan,
             "dr_loss_mean": float(np.mean(dr_losses)) if len(dr_losses) > 0 else np.nan,
             "dr_mixed_reward_mean": float(np.mean(dr_mixed_reward_vals)) if len(dr_mixed_reward_vals) > 0 else np.nan,
             "u_solver_mean": float(np.mean(dr_u_solver_vals)) if len(dr_u_solver_vals) > 0 else np.nan,
-            "u_neutral_mean": float(np.mean(dr_u_neutral_vals)) if len(dr_u_neutral_vals) > 0 else np.nan,
             "u_causer_mean": float(np.mean(dr_u_causer_vals)) if len(dr_u_causer_vals) > 0 else np.nan,
             "v_c_mean": float(np.mean(dr_v_c_vals)) if len(dr_v_c_vals) > 0 else np.nan,
             "v_p_mean": float(np.mean(dr_v_p_vals)) if len(dr_v_p_vals) > 0 else np.nan,
-            "v_mean_mean": float(np.mean(dr_v_mean_vals)) if len(dr_v_mean_vals) > 0 else np.nan,
             "my_mean_mean": float(np.mean(dr_my_mean_vals)) if len(dr_my_mean_vals) > 0 else np.nan,
             **{f"arm_{name}_count": np.nan for name in CONFLICT_ACTION_NAMES},
             **{f"arm_{name}_prob": np.nan for name in CONFLICT_ACTION_NAMES},
@@ -1988,7 +2236,7 @@ def run_training(args):
                 "running_own_p_sum": float(learner.running_own_p_sum),
                 "running_own_p_count": int(learner.running_own_p_count),
             }
-        meta = {"full_duration": float(FULL_DURATION_NORM), "agents": per_agent_meta}
+        meta = {"full_duration": float(FULL_DURATION_NORM), "n_agents": int(n_agents), "agents": per_agent_meta}
         meta_path = artifacts_dir / "dr_mixture_meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)

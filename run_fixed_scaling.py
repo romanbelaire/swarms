@@ -16,7 +16,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from swarm.config import ENABLED_CONFLICT_ARM_NAMES
+from swarm.config import (
+    DEFAULT_ENV_LAYOUT,
+    ENABLED_CONFLICT_ARM_NAMES,
+    ENV_LAYOUT_NAMES,
+    ablation_run_name_suffix,
+)
 
 _TRAIN_SYMBOLS: tuple[object, object] | None = None
 
@@ -77,6 +82,9 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         "avg_p_time_percent",
         "avg_c_time_percent",
         "avg_conflict_percent",
+        "conflict_agent_step_count",
+        "conflict_instance_count",
+        "mean_conflict_instances_per_agent",
         *[f"arm_{name}_prob" for name in ENABLED_CONFLICT_ARM_NAMES],
     ]
     if task["resume"]:
@@ -98,13 +106,14 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
     run_args["mode"] = "task_avoid"
     run_args["baseline_mode"] = "fixed_conflict"
     run_args["fixed_conflict_action"] = str(task["fixed_conflict_action"])
-    run_args["bandit_reward_model"] = "neutral_allsame"
+    run_args["bandit_reward_model"] = "solver_allc"
     run_args["expert_checkpoint"] = str(task["expert_checkpoint"])
     run_args["metrics_csv"] = str(metrics_path)
     run_args["load_weights"] = None
     run_args["grid_size"] = int(task["grid_size"])
     run_args["num_food"] = int(task["num_food"])
     run_args["local_grid_size"] = int(task["local_grid_size"])
+    run_args["env_layout"] = str(task["env_layout"])
 
     print(f"Running {task['run_name']}")
     run_training(SimpleNamespace(**run_args))
@@ -140,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid_size", type=int, default=10)
     parser.add_argument("--num_food", type=int, default=10)
     parser.add_argument("--local_grid_size", type=int, default=5)
+    parser.add_argument(
+        "--env_layout",
+        type=str,
+        default=DEFAULT_ENV_LAYOUT,
+        choices=ENV_LAYOUT_NAMES,
+    )
     return parser
 
 
@@ -154,17 +169,19 @@ def main():
     seeds = _parse_int_list(args.seeds)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    layout_suffix = ablation_run_name_suffix(args.env_layout)
 
     tasks = []
     task_idx = 0
     for n_agents in agent_counts:
         for seed in seeds:
-            run_name = f"fixed_{args.fixed_conflict_action}_agents{n_agents}_seed{seed}"
+            run_name = f"fixed_{args.fixed_conflict_action}{layout_suffix}_agents{n_agents}_seed{seed}"
             tasks.append(
                 {
                     "task_idx": task_idx,
                     "out_dir": str(out_dir),
                     "run_name": run_name,
+                    "env_layout": args.env_layout,
                     "n_agents": n_agents,
                     "seed": seed,
                     "episodes": args.episodes,
@@ -197,6 +214,9 @@ def main():
                 "avg_p_time_percent": float(last["avg_p_time_percent"]),
                 "avg_c_time_percent": float(last["avg_c_time_percent"]),
                 "avg_conflict_percent": float(last["avg_conflict_percent"]),
+                "conflict_agent_step_count": float(last["conflict_agent_step_count"]),
+                "conflict_instance_count": float(last["conflict_instance_count"]),
+                "mean_conflict_instances_per_agent": float(last["mean_conflict_instances_per_agent"]),
             }
         )
 

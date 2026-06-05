@@ -3,6 +3,8 @@ from pettingzoo import ParallelEnv
 from gymnasium.spaces import Discrete, Box
 import pygame
 
+from swarm.config import ENV_LAYOUT_NAMES
+
 
 def normalized_planar_position_xy(ax: np.ndarray, ay: np.ndarray, grid_size: int) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -23,6 +25,17 @@ def normalized_planar_position_xy(ax: np.ndarray, ay: np.ndarray, grid_size: int
 
 
 FREEZE_TAG_TURNS = 3
+
+
+def base_positions_for_layout(grid_size: int, env_layout: str) -> tuple[tuple[int, int], ...]:
+    if env_layout not in ENV_LAYOUT_NAMES:
+        raise ValueError(f"env_layout must be one of {ENV_LAYOUT_NAMES}, got {env_layout!r}")
+    if env_layout == "center_base":
+        return ((grid_size // 2, grid_size // 2),)
+    mid = grid_size // 2
+    c_lo = (mid - 1) // 2
+    c_hi = (mid + grid_size - 1) // 2
+    return ((c_lo, c_lo), (c_hi, c_hi))
 
 
 class RationalSwarmForagingEnv(ParallelEnv):
@@ -59,7 +72,11 @@ class RationalSwarmForagingEnv(ParallelEnv):
     agents is skipped: every agent occupies its ``next_positions`` intent, overlaps allowed (except
     food/base logic unchanged).
 
-    **Rewards:** rewards[agent] += 1 when that agent deposits food at the base. Training code uses infos[agent] ("env_reward", "p_t", "c_t", "n_local") for shaping and logging.
+    **Rewards:** rewards[agent] += 1 when that agent deposits food at a base. Training code uses infos[agent] ("env_reward", "p_t", "c_t", "n_local") for shaping and logging.
+
+    **``env_layout``:** ``center_base`` places one base at the grid center. ``dual_quadrant_base`` places bases at
+    the centers of the low–low and high–high quadrants (split at ``grid_size // 2``), e.g. (2, 2) and (7, 7) when
+    ``grid_size=10``, so foraging does not pull agents to the geometric center.
     """
 
     metadata = {
@@ -77,6 +94,7 @@ class RationalSwarmForagingEnv(ParallelEnv):
         local_grid_size=5,
         render_mode=None,
         suppress_agent_collision: bool = False,
+        env_layout: str = "center_base",
     ):
         self.n_agents = n_agents
         self.grid_size = grid_size
@@ -86,13 +104,16 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.local_grid_size = local_grid_size
         self.render_mode = render_mode
         self.suppress_agent_collision = suppress_agent_collision
+        self.env_layout = env_layout
+        self.base_positions = base_positions_for_layout(self.grid_size, env_layout)
+        self._base_position_set = {tuple(p) for p in self.base_positions}
         if self.grid_size <= 0:
             raise ValueError("grid_size must be positive")
         if self.local_grid_size <= 0:
             raise ValueError("local_grid_size must be positive")
         if self.num_food < 0:
             raise ValueError("num_food must be non-negative")
-        max_non_base_cells = self.grid_size * self.grid_size - 1
+        max_non_base_cells = self.grid_size * self.grid_size - len(self.base_positions)
         if self.n_agents > max_non_base_cells:
             raise ValueError(
                 f"n_agents={self.n_agents} exceeds capacity for grid_size={self.grid_size}; "
@@ -119,7 +140,6 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.agents = []
         self.agent_positions = {}
         self.agent_holding_food = {}
-        self.base_position = (self.grid_size // 2, self.grid_size // 2)
         self.food_positions = []
 
         self.agent_modes = {}
@@ -149,10 +169,10 @@ class RationalSwarmForagingEnv(ParallelEnv):
         self.food_positions = []
         while len(self.food_positions) < self.num_food:
             pos = [np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size)]
-            if pos != list(self.base_position) and pos not in self.food_positions:
+            if tuple(pos) not in self._base_position_set and pos not in self.food_positions:
                 self.food_positions.append(pos)
 
-        used = {tuple(self.base_position)}
+        used = set(self._base_position_set)
         self.agent_positions = {}
         for agent in self.agents:
             while True:
@@ -179,7 +199,6 @@ class RationalSwarmForagingEnv(ParallelEnv):
         ax, ay = self.agent_positions[agent]
         hw = self.local_grid_size // 2
         food_set = {tuple(f) for f in self.food_positions}
-        base_tuple = tuple(self.base_position)
         other_agent_at = {}
         if self.agent_immune_priority[agent] <= 0:
             for a in self.agents:
@@ -198,7 +217,7 @@ class RationalSwarmForagingEnv(ParallelEnv):
                 wx, wy = ax - hw + j, ay - hw + i
                 if wx < 0 or wx >= self.grid_size or wy < 0 or wy >= self.grid_size:
                     grid_flat.append(5)
-                elif (wx, wy) == base_tuple:
+                elif (wx, wy) in self._base_position_set:
                     grid_flat.append(1)
                 elif (wx, wy) in food_set:
                     grid_flat.append(2)
@@ -392,13 +411,13 @@ class RationalSwarmForagingEnv(ParallelEnv):
                     self.agent_positions[lone] = next_positions[lone]
 
         for agent in sorted(self.agents):
-            if self.agent_holding_food[agent] and tuple(self.agent_positions[agent]) == self.base_position:
+            if self.agent_holding_food[agent] and tuple(self.agent_positions[agent]) in self._base_position_set:
                 self.agent_holding_food[agent] = False
                 self.agent_immune_priority[agent] = 0
                 rewards[agent] += 1.0
                 while len(self.food_positions) < self.num_food:
                     new_f = [np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size)]
-                    if new_f != list(self.base_position) and new_f not in self.food_positions:
+                    if tuple(new_f) not in self._base_position_set and new_f not in self.food_positions:
                         self.food_positions.append(new_f)
 
         for agent in sorted(self.agents):
@@ -451,13 +470,14 @@ class RationalSwarmForagingEnv(ParallelEnv):
         for y in range(0, self.window_size, self.cell_size):
             pygame.draw.line(canvas, (200, 200, 200), (0, y), (self.window_size, y))
 
-        base_rect = pygame.Rect(
-            self.base_position[1] * self.cell_size,
-            self.base_position[0] * self.cell_size,
-            self.cell_size,
-            self.cell_size,
-        )
-        pygame.draw.rect(canvas, (0, 0, 255), base_rect)
+        for base_pos in self.base_positions:
+            base_rect = pygame.Rect(
+                base_pos[1] * self.cell_size,
+                base_pos[0] * self.cell_size,
+                self.cell_size,
+                self.cell_size,
+            )
+            pygame.draw.rect(canvas, (0, 0, 255), base_rect)
 
         for f in self.food_positions:
             pygame.draw.circle(

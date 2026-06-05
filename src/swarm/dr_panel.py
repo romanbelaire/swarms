@@ -26,16 +26,17 @@ def _draw_bar_row(surface, font, rect, values, labels, title: str):
 def _draw_w_heatmap(surface, font, rect, w, scenario_delta):
     pygame.draw.rect(surface, (250, 250, 250), rect)
     pygame.draw.rect(surface, (100, 100, 100), rect, 1)
-    cell = min((rect.w - 8) // 3, (rect.h - 24) // 3)
+    n_rows, n_cols = w.shape
+    cell = min((rect.w - 8) // n_cols, (rect.h - 24) // n_rows)
     cell = max(cell, 8)
     ox = rect.x + 4
     oy = rect.y + 4
     surface.blit(font.render("w (role x others)", True, (0, 0, 0)), (ox, oy))
     oy += font.get_height() + 2
     flat_arg = int(w.argmax())
-    ar, ac = flat_arg // 3, flat_arg % 3
-    for r in range(3):
-        for c in range(3):
+    ar, ac = flat_arg // n_cols, flat_arg % n_cols
+    for r in range(n_rows):
+        for c in range(n_cols):
             val = float(w[r, c])
             gray = int(255 * val)
             gray = max(0, min(255, gray))
@@ -48,7 +49,7 @@ def _draw_w_heatmap(surface, font, rect, w, scenario_delta):
             else:
                 pygame.draw.rect(surface, (120, 120, 120), cr, 1)
     d_at_arg = float(scenario_delta[ar, ac])
-    oy += 3 * cell + 4
+    oy += n_rows * cell + 4
     surface.blit(font.render(f"D at argmax(w): {d_at_arg:.3f}", True, (0, 0, 0)), (ox, oy))
 
 
@@ -61,7 +62,7 @@ def render_dr_panel(
     my_mean_by_agent: dict[str, float],
 ):
     """
-    per_agent_rows: each dict has keys agent_id, u (3,), v (3,), w (3,3), scenario_delta (3,3), mixed_reward.
+    per_agent_rows: each dict has keys agent_id, u (2,), v (2,), w (2,2), scenario_delta (2,2), mixed_reward.
     """
     font = pygame.font.SysFont(None, 16)
     small = pygame.font.SysFont(None, 14)
@@ -82,8 +83,8 @@ def render_dr_panel(
     body_h = panel_rect.h - header_h - 16
     slot_h = body_h // n_agents
 
-    u_labels = ("solv", "neut", "caus")
-    v_labels = ("AllC", "AllP", "Same")
+    u_labels = ("solv", "caus")
+    v_labels = ("AllC", "AllP")
 
     for idx, row in enumerate(per_agent_rows):
         agent_id = row["agent_id"]
@@ -113,6 +114,6 @@ def render_dr_panel(
         _draw_bar_row(canvas, small, v_rect, v, v_labels, "v (others)")
         ty += bar_row_h + 4
 
-        hm_h = 3 * 14 + 40
+        hm_h = 2 * 14 + 40
         hm_rect = pygame.Rect(slot.x + 4, ty, slot.w - 8, hm_h)
         _draw_w_heatmap(canvas, small, hm_rect, w, scenario_delta)

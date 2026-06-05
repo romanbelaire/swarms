@@ -36,6 +36,17 @@ Train the expert policy: `src/swarm/training/train_expert.py` fits a 5-action DQ
 .\venv\Scripts\python.exe .\src\swarm\training\train_expert.py --n_agents 1 --episodes 2000 --out .\artifacts\expert\dqn_weights_agent_0.pt
 ```
 
+**Dual-quadrant bases** (two homes in opposite quadrants, no center attractor): train a matching expert and pass the same `--env_layout` to ablations:
+
+```powershell
+$env:SWARM_DEVICE="cpu"
+.\venv\Scripts\python.exe .\src\swarm\training\train_expert.py --env_layout dual_quadrant_base --n_agents 1 --episodes 2000
+.\venv\Scripts\python.exe .\run_ablations.py --env_layout dual_quadrant_base --expert_checkpoint .\artifacts\expert\dqn_dual_quadrant_base_agent_0.pt --agent_counts 5,10 --seeds 0 --episodes 50 --cpu
+.\venv\Scripts\python.exe .\plot_ablations.py --bandit_algorithm ucbv --run_suffix _dualqb --metrics_dir .\artifacts\ablations
+```
+
+`--env_layout` and `--expert_checkpoint` must match (`center_base` + `dqn_weights_agent_0.pt`, or `dual_quadrant_base` + `dqn_dual_quadrant_base_agent_0.pt`). Dual-base run CSVs are named with a `_dualqb` token before `_agents`.
+
 Train task-avoid mode (with pretrained expert):
 
 ```powershell
@@ -78,6 +89,7 @@ Default outputs are written to `artifacts/`:
 - `--alpha`, `--gamma`: DQN optimizer settings
 - `--critic_lr`, `--critic_gamma`: critic optimizer settings
 - `--dr_entropy_coef`: entropy regularization for DR gates
+- `--env_layout`: `center_base` (default) or `dual_quadrant_base` (opposite quadrant centers)
 - `--baseline_mode`: `none`, `bandit_ucb1`, `random_conflict`, `fixed_conflict`
 - `--fixed_conflict_action`: one of `ENABLED_CONFLICT_ARM_NAMES` in `src/swarm/config.py` (`freeze_tag`, `randomwalk3`, `wait3`, `move_clear`, `backwards2`)
 - Task-avoid high-level actions are enabled via `TASK_AVOID_ENABLED_ACTION_IDS` in `src/swarm/config.py`; set an action constant to `-1` to disable it.

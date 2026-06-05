@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from swarm.env.rational_swarm import normalized_planar_position_xy
+from swarm.env.rational_swarm import base_positions_for_layout, normalized_planar_position_xy
 
 
 class RationalSwarmForagingVecEnv:
@@ -39,6 +39,7 @@ class RationalSwarmForagingVecEnv:
         grid_size: int = 10,
         num_food: int = 5,
         local_grid_size: int = 5,
+        env_layout: str = "center_base",
     ):
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
@@ -57,8 +58,11 @@ class RationalSwarmForagingVecEnv:
         self.hw = self.L // 2
         self.obs_dim = self.L * self.L + 2 + 1
 
+        self.env_layout = env_layout
         self.possible_agents = [f"agent_{i}" for i in range(self.n_agents)]
-        self.base_xy = np.array([self.G // 2, self.G // 2], dtype=np.int32)
+        base_positions = base_positions_for_layout(self.G, env_layout)
+        self.base_positions = np.array(base_positions, dtype=np.int32)
+        self._base_position_set = {tuple(p) for p in base_positions}
 
         self._pos = np.zeros((self.N, self.A, 2), dtype=np.int32)
         self._holding = np.zeros((self.N, self.A), dtype=np.bool_)
@@ -73,18 +77,16 @@ class RationalSwarmForagingVecEnv:
     def _reset_row(self, n: int) -> None:
         """Sample foods and agents for row ``n`` using ``self._rng[n]`` (legacy MT19937 ``randint`` draws)."""
         rs = self._rng[n]
-        bx, by = int(self.base_xy[0]), int(self.base_xy[1])
-        base_list = [bx, by]
         foods: list[list[int]] = []
         while len(foods) < self.K:
             pos = [int(rs.randint(0, self.G)), int(rs.randint(0, self.G))]
-            if pos != base_list and pos not in foods:
+            if tuple(pos) not in self._base_position_set and pos not in foods:
                 foods.append(pos)
         for k in range(self.K):
             self._food_xy[n, k, 0] = foods[k][0]
             self._food_xy[n, k, 1] = foods[k][1]
             self._food_alive[n, k] = True
-        used = {tuple(base_list)}
+        used = set(self._base_position_set)
         for f in foods:
             used.add(tuple(f))
         for a in range(self.A):
@@ -122,13 +124,11 @@ class RationalSwarmForagingVecEnv:
 
     def _refill_foods_row(self, n: int) -> None:
         """Refill dead food slots to ``K`` alive (same draws as ``RationalSwarmForagingEnv.step``)."""
-        bx, by = int(self.base_xy[0]), int(self.base_xy[1])
-        base_list = [bx, by]
         pos_flat = self._pos[n]
         rs = self._rng[n]
         while int(self._food_alive[n].sum()) < self.K:
             new_f = [int(rs.randint(0, self.G)), int(rs.randint(0, self.G))]
-            if new_f == base_list:
+            if tuple(new_f) in self._base_position_set:
                 continue
             ok = True
             for k in range(self.K):
@@ -162,7 +162,6 @@ class RationalSwarmForagingVecEnv:
         N = self.N
         ax = self._pos[:, a, 0]
         ay = self._pos[:, a, 1]
-        base_x, base_y = int(self.base_xy[0]), int(self.base_xy[1])
         L = self.L
         jj = np.arange(L, dtype=np.int32)
         ii = np.arange(L, dtype=np.int32)
@@ -170,7 +169,10 @@ class RationalSwarmForagingVecEnv:
         wy1 = ay[:, None, None] - self.hw + ii[None, :, None]
         wx, wy = np.broadcast_arrays(wx1, wy1)
         outb = (wx < 0) | (wx >= self.G) | (wy < 0) | (wy >= self.G)
-        on_base = (wx == base_x) & (wy == base_y)
+        on_base = np.zeros((N, L, L), dtype=np.bool_)
+        for b in range(self.base_positions.shape[0]):
+            bx, by = int(self.base_positions[b, 0]), int(self.base_positions[b, 1])
+            on_base |= (wx == bx) & (wy == by)
 
         fxk = self._food_xy[:, :, 0][:, :, None, None]
         fyk = self._food_xy[:, :, 1][:, :, None, None]
@@ -275,10 +277,9 @@ class RationalSwarmForagingVecEnv:
         self._avoid_rem = avoid_rem
         self._obs_mode_prog = mode_prog.copy()
 
-        bx, by = int(self.base_xy[0]), int(self.base_xy[1])
         for n in range(self.N):
             for a in range(self.A):
-                if self._holding[n, a] and int(self._pos[n, a, 0]) == bx and int(self._pos[n, a, 1]) == by:
+                if self._holding[n, a] and (int(self._pos[n, a, 0]), int(self._pos[n, a, 1])) in self._base_position_set:
                     self._holding[n, a] = False
                     rewards[n, a] += 1.0
                     self._refill_foods_row(n)

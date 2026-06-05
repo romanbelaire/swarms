@@ -53,6 +53,7 @@ def main():
     ax0b.plot(episodes, data["avg_p_time_percent"], color="tab:purple", alpha=0.8, label="P_time_%")
     ax0b.plot(episodes, data["avg_c_time_percent"], color="tab:red", alpha=0.75, label="C_time_%")
     ax0b.plot(episodes, data["avg_conflict_percent"], color="tab:brown", alpha=0.75, label="conflict_%")
+    ax0b.plot(episodes, data["conflict_instance_count"], color="tab:olive", alpha=0.75, label="conflict_instances")
     h1, l1 = ax[0].get_legend_handles_labels()
     h2, l2 = ax0b.get_legend_handles_labels()
     ax[0].legend(h1 + h2, l1 + l2, loc="best")
@@ -74,14 +75,12 @@ def main():
     ax[3].set_title("DR Model Convergence")
 
     ax[4].plot(episodes, data["u_solver_mean"], label="u_solver")
-    ax[4].plot(episodes, data["u_neutral_mean"], label="u_neutral")
     ax[4].plot(episodes, data["u_causer_mean"], label="u_causer")
     ax[4].legend()
     ax[4].set_title("Self-Role Gate Distribution u(a|s)")
 
     ax[5].plot(episodes, data["v_c_mean"], label="v_C")
     ax[5].plot(episodes, data["v_p_mean"], label="v_P")
-    ax[5].plot(episodes, data["v_mean_mean"], label="v_mean")
     ax[5].legend()
     ax[5].set_title("Others-Model Gate Distribution v(b|s)")
 

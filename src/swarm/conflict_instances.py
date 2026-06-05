@@ -186,6 +186,9 @@ class ConflictInstanceTracker:
     def active(self) -> bool:
         return self._active
 
+    def closed_instance_count(self) -> int:
+        return len(self._closed)
+
     def mean_closed_p_norm(self) -> float:
         if len(self._closed) == 0:
             return 0.0
@@ -211,6 +214,17 @@ def new_conflict_trackers(
         agent_id: ConflictInstanceTracker(max_conflict_steps, max_conflict_steps_type)
         for agent_id in agent_ids
     }
+
+
+def episode_closed_conflict_instance_count(
+    conflict_trackers_by_env: list[dict[str, ConflictInstanceTracker]],
+    agent_ids: list[str],
+) -> int:
+    total = 0
+    for env_trackers in conflict_trackers_by_env:
+        for agent_id in agent_ids:
+            total += env_trackers[agent_id].closed_instance_count()
+    return total
 
 
 def episode_mean_own_p_norm(trackers: dict[str, ConflictInstanceTracker], agent_ids: list[str]) -> float:

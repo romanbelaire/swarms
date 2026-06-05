@@ -17,7 +17,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from swarm.config import BANDIT_CONFLICT_ARMS_CSV, ENABLED_CONFLICT_ARM_NAMES
+from swarm.config import (
+    BANDIT_CONFLICT_ARMS_CSV,
+    DEFAULT_ENV_LAYOUT,
+    ENABLED_CONFLICT_ARM_NAMES,
+    ENV_LAYOUT_NAMES,
+    ablation_run_name_suffix,
+)
+from swarm.training.train import conflict_grid_artifact_path, conflict_local_density_artifact_path
 
 _TRAIN_SYMBOLS: tuple[list[str], object, object] | None = None
 
@@ -40,10 +47,9 @@ def _parse_int_list(raw: str) -> list[int]:
 
 
 def _parse_bandit_arm_names(bandit_conflict_arms: str) -> list[str]:
-    arm_names = [name.strip() for name in bandit_conflict_arms.split(",") if name.strip() != ""]
-    if len(arm_names) == 0:
-        raise ValueError("bandit_conflict_arms must list at least one arm for DR ablations")
-    return arm_names
+    from swarm.training.train import baseline_bandit_arms_tuple
+
+    return list(baseline_bandit_arms_tuple(bandit_conflict_arms))
 
 
 BANDIT_DIAGNOSTIC_SUFFIXES = (
@@ -66,17 +72,28 @@ def _bandit_diagnostic_column_names(arm_names: list[str]) -> list[str]:
     return [f"arm_{arm_name}_{suffix}" for arm_name in arm_names for suffix in BANDIT_DIAGNOSTIC_SUFFIXES]
 
 
-def _required_resume_columns(arm_names: list[str] | None) -> list[str]:
+def _required_resume_columns(arm_names: list[str] | None, n_agents: int) -> list[str]:
     base = [
         "episode_env_reward",
         "avg_env_reward_last_50",
         "avg_p_time_percent",
         "avg_c_time_percent",
         "avg_conflict_percent",
+        "conflict_agent_step_count",
+        "conflict_instance_count",
+        "mean_conflict_instances_per_agent",
     ]
     if arm_names is None:
         return [*base, *[f"arm_{name}_prob" for name in ENABLED_CONFLICT_ARM_NAMES]]
-    return [*base, *_bandit_diagnostic_column_names(arm_names)]
+    return [
+        *base,
+        *_bandit_diagnostic_column_names(arm_names),
+        *[
+            f"arm_{arm_name}_agent_{agent_idx}_prob"
+            for arm_name in arm_names
+            for agent_idx in range(n_agents)
+        ],
+    ]
 
 
 def _diagnostics_summary_row(
@@ -138,11 +155,16 @@ def _run_and_collect(
     baseline_mode: str,
     fixed_conflict_action: str,
     bandit_reward_model: str,
+    bandit_algorithm: str,
+    bandit_gradient_alpha: float,
+    bandit_linucb_alpha: float,
+    bandit_lin_ts_v: float,
     bandit_conflict_arms: str,
     resume: bool,
     grid_size: int,
     num_food: int,
     local_grid_size: int,
+    env_layout: str,
 ) -> dict[str, float]:
     metrics_path = out_dir / f"{run_name}.csv"
     _, _, run_training = _get_train_symbols()
@@ -151,7 +173,7 @@ def _run_and_collect(
         if baseline_mode == "bandit_ucb1"
         else None
     )
-    required_resume_columns = _required_resume_columns(resume_arm_names)
+    required_resume_columns = _required_resume_columns(resume_arm_names, n_agents)
     if resume:
         resumed_last = _load_last_row_if_complete(
             metrics_path,
@@ -159,8 +181,19 @@ def _run_and_collect(
             required_columns=required_resume_columns,
         )
         if resumed_last is not None:
-            print(f"Skipping completed run {run_name}")
-            return resumed_last
+            missing_artifacts = []
+            if not conflict_local_density_artifact_path(metrics_path).exists():
+                missing_artifacts.append("conflict local density grid")
+            if baseline_mode != "collision_free" and not conflict_grid_artifact_path(metrics_path).exists():
+                missing_artifacts.append("conflict grid")
+            if len(missing_artifacts) > 0:
+                print(
+                    f"Re-running {run_name}: metrics complete but missing "
+                    + ", ".join(missing_artifacts)
+                )
+            else:
+                print(f"Skipping completed run {run_name}")
+                return resumed_last
     run_args = vars(base_defaults).copy()
     run_args["n_agents"] = n_agents
     run_args["episodes"] = episodes
@@ -171,6 +204,10 @@ def _run_and_collect(
     run_args["baseline_mode"] = baseline_mode
     run_args["fixed_conflict_action"] = fixed_conflict_action
     run_args["bandit_reward_model"] = bandit_reward_model
+    run_args["bandit_algorithm"] = bandit_algorithm
+    run_args["bandit_gradient_alpha"] = bandit_gradient_alpha
+    run_args["bandit_linucb_alpha"] = bandit_linucb_alpha
+    run_args["bandit_lin_ts_v"] = bandit_lin_ts_v
     run_args["bandit_conflict_arms"] = bandit_conflict_arms
     run_args["expert_checkpoint"] = expert_checkpoint
     run_args["metrics_csv"] = str(metrics_path)
@@ -178,6 +215,7 @@ def _run_and_collect(
     run_args["grid_size"] = grid_size
     run_args["num_food"] = num_food
     run_args["local_grid_size"] = local_grid_size
+    run_args["env_layout"] = env_layout
     print(f"Running {run_name}")
     run_training(SimpleNamespace(**run_args))
     return _load_last_row(metrics_path)
@@ -202,11 +240,16 @@ def _run_task(task: dict) -> tuple[int, dict[str, float]]:
         baseline_mode=task["baseline_mode"],
         fixed_conflict_action=task["fixed_conflict_action"],
         bandit_reward_model=task["bandit_reward_model"],
+        bandit_algorithm=task["bandit_algorithm"],
+        bandit_gradient_alpha=task["bandit_gradient_alpha"],
+        bandit_linucb_alpha=task["bandit_linucb_alpha"],
+        bandit_lin_ts_v=task["bandit_lin_ts_v"],
         bandit_conflict_arms=task["bandit_conflict_arms"],
         resume=task["resume"],
         grid_size=task["grid_size"],
         num_food=task["num_food"],
         local_grid_size=task["local_grid_size"],
+        env_layout=task["env_layout"],
     )
     return int(task["task_idx"]), last
 
@@ -240,6 +283,25 @@ def build_ablation_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_food", type=int, default=10)
     parser.add_argument("--local_grid_size", type=int, default=5)
     parser.add_argument(
+        "--env_layout",
+        type=str,
+        default=DEFAULT_ENV_LAYOUT,
+        choices=ENV_LAYOUT_NAMES,
+        help="Base placement; dual_quadrant_base requires a matching expert checkpoint.",
+    )
+    from swarm.training.train import BANDIT_ALGORITHM_NAMES
+
+    parser.add_argument(
+        "--bandit_algorithm",
+        type=str,
+        default="ucbv",
+        choices=BANDIT_ALGORITHM_NAMES,
+        help="Bandit algorithm for DR reward-model ablations.",
+    )
+    parser.add_argument("--bandit_gradient_alpha", type=float, default=0.1)
+    parser.add_argument("--bandit_linucb_alpha", type=float, default=1.0)
+    parser.add_argument("--bandit_lin_ts_v", type=float, default=1.0)
+    parser.add_argument(
         "--bandit_conflict_arms",
         type=str,
         default=BANDIT_CONFLICT_ARMS_CSV,
@@ -261,10 +323,11 @@ def main():
     bandit_arm_names = _parse_bandit_arm_names(args.bandit_conflict_arms)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    layout_suffix = ablation_run_name_suffix(args.env_layout)
 
     methods = [
         {
-            "name": f"dr_{reward_model}",
+            "name": f"dr_{args.bandit_algorithm}_{reward_model}",
             "baseline_mode": "bandit_ucb1",
             "bandit_reward_model": reward_model,
             "plot_order": idx,
@@ -282,12 +345,13 @@ def main():
     fixed_task_idx = 0
     for n_agents in agent_counts:
         for action_name in fixed_conflict_actions:
-            run_name = f"fixed_once_{action_name}_agents{n_agents}_seed{fixed_once_seed}"
+            run_name = f"fixed_once_{action_name}{layout_suffix}_agents{n_agents}_seed{fixed_once_seed}"
             fixed_tasks.append(
                 {
                     "task_idx": fixed_task_idx,
                     "out_dir": str(out_dir),
                     "run_name": run_name,
+                    "env_layout": args.env_layout,
                     "n_agents": n_agents,
                     "seed": fixed_once_seed,
                     "episodes": args.episodes,
@@ -300,19 +364,24 @@ def main():
                     "expert_checkpoint": args.expert_checkpoint,
                     "baseline_mode": "fixed_conflict",
                     "fixed_conflict_action": action_name,
-                    "bandit_reward_model": "neutral_allsame",
+                    "bandit_reward_model": "solver_allc",
+                    "bandit_algorithm": args.bandit_algorithm,
+                    "bandit_gradient_alpha": args.bandit_gradient_alpha,
+                    "bandit_linucb_alpha": args.bandit_linucb_alpha,
+                    "bandit_lin_ts_v": args.bandit_lin_ts_v,
                     "bandit_conflict_arms": "",
                     "resume": args.resume,
                     "force_cpu": args.cpu,
                 }
             )
             fixed_task_idx += 1
-        run_name_cf = f"fixed_collision_free_agents{n_agents}_seed{fixed_once_seed}"
+        run_name_cf = f"fixed_collision_free{layout_suffix}_agents{n_agents}_seed{fixed_once_seed}"
         fixed_tasks.append(
             {
                 "task_idx": fixed_task_idx,
                 "out_dir": str(out_dir),
                 "run_name": run_name_cf,
+                "env_layout": args.env_layout,
                 "n_agents": n_agents,
                 "seed": fixed_once_seed,
                 "episodes": args.episodes,
@@ -325,7 +394,11 @@ def main():
                 "expert_checkpoint": args.expert_checkpoint,
                 "baseline_mode": "collision_free",
                 "fixed_conflict_action": "backwards2",
-                "bandit_reward_model": "neutral_allsame",
+                "bandit_reward_model": "solver_allc",
+                "bandit_algorithm": args.bandit_algorithm,
+                "bandit_gradient_alpha": args.bandit_gradient_alpha,
+                "bandit_linucb_alpha": args.bandit_linucb_alpha,
+                "bandit_lin_ts_v": args.bandit_lin_ts_v,
                 "bandit_conflict_arms": "",
                 "resume": args.resume,
                 "force_cpu": args.cpu,
@@ -348,6 +421,9 @@ def main():
                 "avg_p_time_percent": float(last["avg_p_time_percent"]),
                 "avg_c_time_percent": float(last["avg_c_time_percent"]),
                 "avg_conflict_percent": float(last["avg_conflict_percent"]),
+                "conflict_agent_step_count": float(last["conflict_agent_step_count"]),
+                "conflict_instance_count": float(last["conflict_instance_count"]),
+                "mean_conflict_instances_per_agent": float(last["mean_conflict_instances_per_agent"]),
             }
         )
 
@@ -358,12 +434,13 @@ def main():
     for n_agents in agent_counts:
         for seed in seeds:
             for method in methods:
-                run_name = f"{method['name']}_agents{n_agents}_seed{seed}"
+                run_name = f"{method['name']}{layout_suffix}_agents{n_agents}_seed{seed}"
                 main_tasks.append(
                     {
                         "task_idx": task_idx,
                         "out_dir": str(out_dir),
                         "run_name": run_name,
+                        "env_layout": args.env_layout,
                         "n_agents": n_agents,
                         "seed": seed,
                         "episodes": args.episodes,
@@ -377,6 +454,10 @@ def main():
                         "baseline_mode": method["baseline_mode"],
                         "fixed_conflict_action": "backwards2",
                         "bandit_reward_model": method["bandit_reward_model"],
+                        "bandit_algorithm": args.bandit_algorithm,
+                        "bandit_gradient_alpha": args.bandit_gradient_alpha,
+                        "bandit_linucb_alpha": args.bandit_linucb_alpha,
+                        "bandit_lin_ts_v": args.bandit_lin_ts_v,
                         "bandit_conflict_arms": args.bandit_conflict_arms,
                         "method": method["name"],
                         "plot_order": method["plot_order"],
@@ -399,6 +480,9 @@ def main():
                 "avg_p_time_percent": float(last["avg_p_time_percent"]),
                 "avg_c_time_percent": float(last["avg_c_time_percent"]),
                 "avg_conflict_percent": float(last["avg_conflict_percent"]),
+                "conflict_agent_step_count": float(last["conflict_agent_step_count"]),
+                "conflict_instance_count": float(last["conflict_instance_count"]),
+                "mean_conflict_instances_per_agent": float(last["mean_conflict_instances_per_agent"]),
                 **{f"arm_{name}_prob": float(last[f"arm_{name}_prob"]) for name in ENABLED_CONFLICT_ARM_NAMES},
             }
         )
@@ -435,6 +519,8 @@ def main():
         str(fixed_once_summary_path),
         "--out_png",
         str(out_dir / "ablation_scaling.png"),
+        "--out_conflict_metrics_dir",
+        str(out_dir),
         "--bandit_summary_csv",
         str(diagnostics_summary_path),
         "--bandit_conflict_arms",
@@ -445,6 +531,16 @@ def main():
         str(out_dir),
         "--out_local_util_grid",
         str(out_dir / "bandit_local_util_grid.png"),
+        "--out_swarm_convergence",
+        str(out_dir / "bandit_swarm_behavioral_convergence.png"),
+        "--out_conflict_heatmap",
+        str(out_dir / "conflict_location_heatmap.png"),
+        "--out_conflict_local_heatmap",
+        str(out_dir / "conflict_local_density_heatmap.png"),
+        "--out_conflict_local_n30_by_arm",
+        str(out_dir / "conflict_local_density_heatmap_n30_by_arm.png"),
+        "--conflict_local_n30_arm_split",
+        "30",
     ]
     print(f"Running ablation plots: {' '.join(plot_cmd)}")
     subprocess.run(plot_cmd, check=True)

@@ -75,6 +75,7 @@ def main():
             raise FileNotFoundError(f"DR meta not found: {meta_path}")
         meta = DRMixtureEvaluator.load_meta(meta_path)
         full_duration = float(meta["full_duration"])
+        n_agents_meta = int(meta["n_agents"])
         agents_meta = meta["agents"]
         my_mean_by_agent = {}
         dr_evaluators = {}
@@ -92,6 +93,7 @@ def main():
             dr_evaluators[agent_id] = DRMixtureEvaluator(
                 state_dict_path=dr_path,
                 full_duration=full_duration,
+                n_agents=n_agents_meta,
                 my_mean=my_mean_by_agent[agent_id],
                 obs_dim=OBS_DIM,
             )
@@ -121,8 +123,9 @@ def main():
             rows = []
             for aid in env.possible_agents:
                 own_p = float(infos_dict[aid]["p_t"])
+                own_c = float(infos_dict[aid]["c_t"])
                 local_util = step_local_utility_mean(infos_dict, aid, positions)
-                out = dr_evaluators[aid].evaluate(o_dict[aid], local_util, own_p)
+                out = dr_evaluators[aid].evaluate(o_dict[aid], local_util, own_p, own_c)
                 rows.append(
                     {
                         "agent_id": aid,
